@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# agent-spawn — spin up a fresh Claude or Codex session in tmux.
+#
+#   agent-spawn claude [dir]     -> new agent, placement chosen automatically
+#   agent-spawn codex  [dir]     -> same, running `codex`
+#   agent-spawn retab <session>  -> re-request the editor tab for a session and
+#                                   check it opened in the caller's window
+#   agent-spawn composer <pane>  -> empty | draft | kick | none: may that agent's
+#                                   input line be typed into right now?
+#
+# Placement:
+#   default                detached session + a new TERMINAL TAB in the running
+#                          VS Code window, via the local `agent-tabs` extension
+#                          (drops a request file the extension picks up).
+#   --tab                  detached session + its own Windows Terminal tab.
+#   --window / --here      new WINDOW in the current tmux session instead (shares
+#                          the terminal tab, switch with `prefix + n` / `prefix + p`).
+#   --no-tab               detached session only, nothing attached (use this when
+#                          a script or another agent spawns an agent).
+#
+# Brief:
+#   "<text>" | --context "<text>" | --context-file <path>
+#                          handed to the new agent by the agent-peer-intro hook,
+#                          then a kickoff message makes it act on the brief at once.
+#   --no-kickoff           deliver the brief but do not prompt the agent.
+#   --no-wait              do not wait for the editor tab to be confirmed.
+#   --model <model>        start the agent on that model (claude --model / codex -m).
+#
+# Design notes:
+#  - Session/window naming is claude-N / codex-N, first free index wins.
+#  - The agent binary is started with send-keys into a login shell rather than
+#    as the session's command, so the pane survives the agent exiting.
+set -euo pipefail
+
+usage() {
+  awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
+  exit "${1:-0}"
+}
+
+# composer_state PANE prints one word about an agent's input line:
+#   empty  the live composer is idle (no text, or only a dim placeholder)
+#   draft  someone has typed into it (on any of its lines)
+#   kick   it holds the spawn kickoff text
+#   none   no composer: still starting, a menu is open, or it is a shell
+# Only the lowest prompt line on screen counts (no skipping upward past a menu
+# to an older prompt). Claude's ❯ line must sit right under a ─ border, which a
+# shell prompt starting with ❯ never does; Codex's starts with ›. Any numbered
+# choice on the bottom 12 lines (trust or approval menus) means "none". The
+# composer region runs to Claude's closing ─ border, or for Codex to the blank
+# line above its footer. Placeholders are drawn dim (SGR 2), typed text is not.
+composer_state() {
+  tmux capture-pane -e -p -t "$1" 2>/dev/null | python3 -c '
+import re, sys
+raw = sys.stdin.read().rstrip("\n").split("\n")
+plain = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in raw]
+n = len(plain)
+if any(re.match(r"\s*[│ ]*(❯|›)?\s*\d+\.\s", plain[i]) for i in range(max(0, n - 12), n)):
+    print("none"); sys.exit()
+idx = next((i for i in reversed(range(max(0, n - 8), n)) if re.match(r"(❯|›)", plain[i])), None)
+if idx is None:
+    print("none"); sys.exit()
+claude = plain[idx].startswith("❯")
+if claude and not (idx and re.match(r"[─╭]", plain[idx - 1])):
+    print("none"); sys.exit()
+end = idx + 1
+if claude:
+    while end < n and not re.match(r"[─╰]", plain[end]): end += 1
+else:
+    blanks = [i for i in range(idx + 1, n) if not plain[i].strip()]
+    end = blanks[-1] if blanks else n
+region = [re.sub(r"^.*?(❯|›)", "", raw[idx], count=1)] + raw[idx + 1:end]
+def visible(line):
+    line = re.sub(r"\x1b\[2m.*?(\x1b\[0m|\x1b\[22m|$)", "", line)   # dim spans
+    return re.sub(r"\x1b\[[0-9;]*m", "", line).replace("\xa0", " ").strip(" │")
+text = " ".join(t for t in map(visible, region) if t)
+print("kick" if text.startswith("Start now") else "draft" if text else "empty")'
+}
+
+# request_tab SESSION DIR: ask the agent-tabs editor extension for a terminal
+# tab attached to SESSION, then confirm it opened in the window that holds the
+# caller's tab. Returns 0 confirmed, 3 not confirmed, 2 queue not writable.
+request_tab() {
+  local session="$1" dir="$2"
+  # The editor's name, and the queue (cmd.exe is skipped when AGENT_TABS_DIR is set).
+  local only=""
+  [[ -n "${AGENT_TABS_DIR:-}" ]] && only=1
+  BRIDGE_EDITOR_ONLY="$only" . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_winenv.sh"
+  local queue="$AGENT_TABS_DIR"
+  mkdir -p "$queue" 2>/dev/null || return 2
+  local req="${queue}/${session}.json" log="${queue}/state/agent-tabs.log"
+  # from=<caller's tab>: the extension opens the tab in that tab's window.
+  # below=<tab> (AGENT_TAB_BELOW): open it in a group under that tab.
+  local from=""
+  [[ -n "${TMUX:-}" ]] && from="$(tmux display -p '#{session_name}' 2>/dev/null || true)"
+  # Only log lines written after this request count as evidence (pane numbers
+  # and so session names are reused after a tmux restart).
+  local offset=0
+  [[ -f "$log" ]] && offset="$(wc -l <"$log")"
+  python3 -c 'import json,sys; print(json.dumps(dict(zip(["session","distro","dir","below","from"], sys.argv[1:]))))' \
+    "$session" "${WSL_DISTRO_NAME:-}" "$dir" "${AGENT_TAB_BELOW:-}" "$from" >"$req" || return 2
+  echo "     requested a $EDITOR_NAME terminal tab for $session"
+  [[ "$WAIT_TAB" == 1 ]] || return 0
+  local line attached
+  for _ in $(seq 1 20); do
+    sleep 1
+    [[ -e "$req" ]] && continue
+    line="$(tail -n +"$((offset + 1))" "$log" 2>/dev/null | grep -F " open ${session} " | tail -1 || true)"
+    attached="$(tmux display -p -t "=${session}" '#{session_attached}' 2>/dev/null || echo 0)"
+    [[ -n "$line" && "$attached" != 0 ]] || continue
+    # groups look like "1:[a] 2:[b,c]": cut at each " N:[" boundary and the
+    # last "]", so names may themselves hold brackets; compare whole names.
+    if [[ -z "$from" ]] || python3 -c '
+import re, sys
+groups = re.split(r"\s*\d+:\[", sys.argv[1])
+names = {n for g in groups if g for n in g.rstrip().removesuffix("]").split(",")}
+sys.exit(0 if sys.argv[2] in names else 1)' "${line#*groups }" "$from"; then
+      echo "[ok] $EDITOR_NAME tab open${from:+ in the window with $from}"
+      return 0
+    fi
+    echo "[warn] tab opened in a different $EDITOR_NAME window than $from: $line" >&2
+    echo "     repair: detach that client (tmux list-clients -t $session), focus the user's window, run: agent-spawn retab $session" >&2
+    return 3
+  done
+  if [[ -e "$req" ]]; then
+    echo "[warn] request not picked up in 20 s: agent-tabs extension not running (reload the $EDITOR_NAME window)" >&2
+  else
+    echo "[warn] request picked up but no attached tab in 20 s (check WSL interop: cmd.exe /c echo ok)" >&2
+  fi
+  echo "     retry: agent-spawn retab $session   or attach by hand: tmux attach -t $session" >&2
+  return 3
+}
+
+AGENT="${1:-}"
+[[ -z "$AGENT" || "$AGENT" == "-h" || "$AGENT" == "--help" ]] && usage 0
+
+WAIT_TAB=1
+if [[ "$AGENT" == "composer" ]]; then
+  # agent-spawn composer <pane>: print empty | draft | kick | none (see above).
+  [[ -n "${2:-}" ]] || { echo "usage: agent-spawn composer <pane>" >&2; exit 2; }
+  composer_state "$2"
+  exit 0
+fi
+if [[ "$AGENT" == "retab" ]]; then
+  # agent-spawn retab <session>: re-request the editor tab for an existing
+  # session and run the same window check as a fresh spawn.
+  [[ -n "${2:-}" ]] || { echo "usage: agent-spawn retab <session>" >&2; exit 2; }
+  tmux has-session -t "=$2" 2>/dev/null || { echo "agent-spawn: no tmux session $2" >&2; exit 1; }
+  request_tab "$2" "$(tmux display -p -t "=$2" '#{pane_current_path}')"
+  exit $?
+fi
+
+case "$AGENT" in
+  claude|codex) ;;
+  *) echo "agent-spawn: unknown agent '$AGENT' (expected: claude | codex)" >&2; exit 2 ;;
+esac
+shift
+
+DIR="${PWD}"
+# auto: resolved to an editor tab unless --window/--tab/--no-tab.
+MODE=auto
+CONTEXT=""
+RELATION=""   # extend | fresh | "" (unstated)
+KICKOFF=1
+MODEL=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-tab) MODE=detached; shift ;;
+    --tab) MODE=tab; shift ;;
+    --window|--here) MODE=window; shift ;;
+    --context) CONTEXT="$2"; shift 2 ;;
+    --context-file) CONTEXT="$(cat "$2")"; shift 2 ;;
+    --extend|--continues) RELATION=extend; shift ;;
+    --fresh|--new-project) RELATION=fresh; shift ;;
+    --no-kickoff) KICKOFF=0; shift ;;
+    --no-wait) WAIT_TAB=0; shift ;;
+    --model) [[ -n "${2:-}" ]] || { echo "agent-spawn: --model needs a model name" >&2; exit 2; }
+             MODEL="$2"; shift 2 ;;
+    "") shift ;;
+    -*) echo "agent-spawn: unknown flag $1" >&2; exit 2 ;;
+    *)
+      # A directory is the working directory; anything else is the briefing.
+      if [[ -d "$1" ]]; then DIR="$1"; else CONTEXT="${CONTEXT:+$CONTEXT }$1"; fi
+      shift
+      ;;
+  esac
+done
+
+# "extend: ..." / "fresh: ..." prefixes in the briefing set the relation.
+case "$CONTEXT" in
+  extend:*|continue:*) RELATION=extend; CONTEXT="${CONTEXT#*:}" ;;
+  fresh:*|new:*)       RELATION=fresh;   CONTEXT="${CONTEXT#*:}" ;;
+esac
+CONTEXT="${CONTEXT# }"
+[[ -n "$CONTEXT" && -z "$RELATION" ]] && RELATION=extend
+
+# The launch line is typed into a shell, so the model name must be a plain token.
+LAUNCH="$AGENT"
+if [[ -n "$MODEL" ]]; then
+  [[ "$MODEL" =~ ^[][A-Za-z0-9._:-]+$ ]] || { echo "agent-spawn: bad model name '$MODEL'" >&2; exit 2; }
+  if [[ "$AGENT" == claude ]]; then LAUNCH="claude --model '$MODEL'"; else LAUNCH="codex -m '$MODEL'"; fi
+fi
+
+command -v "$AGENT" >/dev/null 2>&1 || { echo "agent-spawn: '$AGENT' not on PATH" >&2; exit 1; }
+[[ -d "$DIR" ]] || { echo "agent-spawn: not a directory: $DIR" >&2; exit 1; }
+DIR="$(cd "$DIR" && pwd)"
+
+if [[ "$MODE" == "auto" ]]; then
+  MODE=vscode
+fi
+
+# First free name. Windows and sessions share the claude-N namespace so the
+# name always identifies the agent no matter where it was placed.
+name_taken() {
+  tmux has-session -t "=$1" 2>/dev/null && return 0
+  tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -qx "$1"
+}
+n=1
+while name_taken "${AGENT}-${n}"; do n=$((n+1)); done
+NAME="${AGENT}-${n}"
+
+if [[ "$MODE" == "window" ]]; then
+  # New window in the session this command was run from. tmux resolves the
+  # target from $TMUX_PANE, so a spawn from any pane lands in that pane's
+  # session rather than whichever session tmux considers "current".
+  # new-window's -t takes a window target, not a pane, so resolve the pane's
+  # session name first and target "<session>:".
+  SRC_SESSION=""
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    SRC_SESSION="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)"
+  fi
+  if [[ -n "$SRC_SESSION" ]]; then
+    WINDOW_ID="$(tmux new-window -P -F '#{session_name}:#{window_index}' -t "${SRC_SESSION}:" -n "$NAME" -c "$DIR")"
+  else
+    WINDOW_ID="$(tmux new-window -P -F '#{session_name}:#{window_index}' -n "$NAME" -c "$DIR")"
+  fi
+  tmux send-keys -t "$WINDOW_ID" "$LAUNCH" Enter
+  echo "[ok] tmux window: $WINDOW_ID ($NAME)  (dir: $DIR)"
+  echo "     switch with: prefix + n  /  tmux select-window -t $WINDOW_ID"
+  exit 0
+fi
+
+# Create with the provisional name, then rename to the pane id so the session,
+# the tmux-bridge label and the editor tab all read claude-pane-6.
+SESSION="$NAME"
+tmux new-session -d -s "$SESSION" -c "$DIR"
+
+CHILD_PANE="$(tmux display-message -p -t "${SESSION}:0.0" '#{pane_id}' 2>/dev/null || true)"
+if [[ -n "$CHILD_PANE" ]]; then
+  PANE_NAME="${AGENT}-pane-${CHILD_PANE#%}"
+  if tmux rename-session -t "$SESSION" "$PANE_NAME" 2>/dev/null; then
+    SESSION="$PANE_NAME"
+    tmux rename-window -t "${SESSION}:0" "$PANE_NAME" 2>/dev/null || true
+  fi
+fi
+
+echo "[ok] tmux session: $SESSION  (dir: $DIR)"
+
+# Peer wiring: label the new pane and record who spawned it, so both sides can
+# address each other with tmux-bridge without looking anything up.
+PARENT_PANE="${TMUX_PANE:-}"
+PARENT_LABEL=""
+if [[ -n "$PARENT_PANE" ]]; then
+  PARENT_LABEL="$(tmux display-message -p -t "$PARENT_PANE" '#{session_name}:#{window_name}' 2>/dev/null || true)"
+fi
+if [[ -n "$CHILD_PANE" ]] && command -v tmux-bridge >/dev/null 2>&1; then
+  tmux-bridge name "$CHILD_PANE" "$SESSION" >/dev/null 2>&1 || true
+fi
+if [[ -n "$CHILD_PANE" ]]; then
+  PEER_DIR="${HOME}/.claude/agent-peers"
+  mkdir -p "$PEER_DIR" 2>/dev/null || true
+  python3 - "$PEER_DIR/${CHILD_PANE}.json" "$CHILD_PANE" "$SESSION" "$PARENT_PANE" "$PARENT_LABEL" "$RELATION" "$CONTEXT" <<'PY' || true
+import json, sys
+path, pane, label, ppane, plabel, relation, context = sys.argv[1:8]
+import subprocess
+# The tmux server pid: pane ids start again at %0 on a new server, so a file from an older
+# server names another session's pane (agent-peer-intro.sh ignores it).
+server = subprocess.run(["tmux", "display-message", "-p", "#{pid}"], capture_output=True, text=True).stdout.strip()
+json.dump({"self_pane": pane, "self_label": label, "parent_pane": ppane,
+           "parent_label": plabel, "relation": relation, "context": context, "server": server},
+          open(path, "w"))
+PY
+  echo "     peer: $SESSION = $CHILD_PANE${PARENT_PANE:+  (you are $PARENT_PANE)}"
+fi
+
+# Start the agent only now: its SessionStart hook reads the peer file above.
+tmux send-keys -t "${SESSION}:0.0" "$LAUNCH" Enter
+
+# A brief in the session context is not a prompt, so the agent would sit idle.
+# In the background: wait for its input box, send one kickoff line, confirm it
+# was submitted. Log: ~/.claude/agent-peers/<pane>.kickoff.log
+if [[ -n "$CONTEXT" && "$KICKOFF" == 1 && -n "$CHILD_PANE" ]]; then
+  KLOG="${HOME}/.claude/agent-peers/${CHILD_PANE}.kickoff.log"
+  KMSG="Start now: act on the spawner brief from your session start."
+  # The agent re-wraps the echoed message with real line breaks in a narrow
+  # pane, so compare with all whitespace removed.
+  kickoff_above() {
+    tmux capture-pane -p -S -300 -t "$CHILD_PANE" 2>/dev/null | head -n -8 | tr -d '[:space:]' |
+      grep -qF "Startnow:actonthespawnerbrief"
+  }
+  # A fresh log per spawn: pane numbers are reused after a tmux restart. The
+  # worker ends it with exactly one final line: sent | not-sent: <why> |
+  # unconfirmed: <why>. "waiting" means it is still running.
+  echo "waiting $(date -Is) $SESSION" >"$KLOG"
+  (
+    # Every way out writes one final line. typed: 0 nothing sent, 1 text sent.
+    set +e
+    typed=0 finished=""
+    final() { finished=1; echo "$1 $(date -Is) $SESSION" >"$KLOG"; exit 0; }
+    trap '[[ -n "$finished" ]] || { if [[ "$typed" == 1 ]]; then echo "unconfirmed: worker stopped after typing $(date -Is) $SESSION"; else echo "not-sent: worker stopped before typing $(date -Is) $SESSION"; fi >"$KLOG"; }' EXIT
+    deadline=$((SECONDS + 90))
+    while :; do
+      (( SECONDS < deadline )) || final "not-sent: no idle composer within 90 s"
+      sleep 1
+      [[ "$(composer_state "$CHILD_PANE")" == empty ]] || continue
+      sleep 1
+      [[ "$(composer_state "$CHILD_PANE")" == empty ]] && break   # still idle after a second
+    done
+    tmux send-keys -t "$CHILD_PANE" -l "$KMSG" || final "not-sent: tmux could not type into $CHILD_PANE"
+    typed=1
+    sleep 0.5
+    tmux send-keys -t "$CHILD_PANE" Enter || final "unconfirmed: kickoff typed, Enter failed"
+    for _ in 1 2 3; do
+      sleep 2
+      case "$(composer_state "$CHILD_PANE")" in
+        kick) tmux send-keys -t "$CHILD_PANE" Enter ;;   # Enter was swallowed
+        *) kickoff_above && final "sent" ;;
+      esac
+    done
+    final "unconfirmed: kickoff typed and Enter pressed, echo not seen"
+  ) >/dev/null 2>&1 &
+  disown
+  echo "     brief: delivered at session start; kickoff runs when the composer is idle (status: $KLOG)"
+fi
+
+if [[ "$MODE" == "detached" ]]; then
+  echo "     attach with: tmux attach -t $SESSION"
+  exit 0
+fi
+
+if [[ "$MODE" == "vscode" ]]; then
+  if request_tab "$SESSION" "$DIR"; then exit 0; else rc=$?; fi
+  [[ "$rc" == 2 ]] || exit "$rc"   # 2 = queue dir not writable: fall back to wt.exe
+  echo "     cannot write the agent-tabs queue, falling back to a Windows Terminal tab" >&2
+fi
+
+WT="$(command -v wt.exe || true)"
+if [[ -z "$WT" ]]; then
+  echo "     wt.exe not found — attach with: tmux attach -t $SESSION"
+  exit 0
+fi
+
+DISTRO="${WSL_DISTRO_NAME:-}"
+WT_ARGS=(-w 0 nt --title "$SESSION")
+if [[ -n "$DISTRO" ]]; then
+  WT_ARGS+=(wsl.exe -d "$DISTRO" --)
+else
+  WT_ARGS+=(wsl.exe --)
+fi
+WT_ARGS+=(bash -lc "tmux attach -t '$SESSION'")
+
+if "$WT" "${WT_ARGS[@]}" >/dev/null 2>&1; then
+  echo "     opened a Windows Terminal tab attached to $SESSION"
+else
+  echo "     wt.exe failed — attach with: tmux attach -t $SESSION" >&2
+fi

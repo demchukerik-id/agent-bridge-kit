@@ -1,0 +1,32 @@
+%% Confirmed flow: send a prompt to a specific browser-agent chat and receive
+%% the reply back into the lead agent's virtual buffer.
+%% Render with: any Mermaid renderer (e.g. https://mermaid.live)
+sequenceDiagram
+    autonumber
+    participant LA as Lead Agent<br/>(claude-code)
+    participant BS as Bridge Server<br/>(127.0.0.1:7777)
+    participant DA as CDP Daemon<br/>(WSL)
+    participant CH as Chrome Side Panel<br/>(tabId=N)
+
+    LA->>BS: POST /send<br/>{mode:sidepanel, to:browser,<br/>tab_id:N, from_pane:virtual:claude-code,<br/>text:"..."}
+    BS-->>LA: 200 {id, queued:true}
+    Note over BS: outbox.append(item)<br/>in_flight[id] = {from_pane, to_agent}
+
+    DA->>BS: GET /poll?mode=sidepanel
+    BS-->>DA: 200 item
+
+    Note over DA: resolve_agent_port("browser") -> 9222<br/>find_sidepanel_target_at(host, 9222, tab_id=N)
+    DA->>CH: CDP Runtime.evaluate<br/>(type prompt + click send)
+    CH-->>DA: ack
+    loop until reply DOM is final + stable
+        DA->>CH: read .claude-response
+    end
+    CH-->>DA: full reply text
+
+    DA->>BS: POST /reply<br/>{id, from_pane:virtual:claude-code, text:"..."}
+    Note over BS: from_pane starts with "virtual:"<br/>=> replies_buffer[id] = {text, from_agent, ts}
+    BS-->>DA: 200 {buffered:true}
+
+    LA->>BS: GET /reply?id=<id>
+    BS-->>LA: 200 {id, text, from_agent, from_pane, ts}
+    Note over BS: replies_buffer.pop(id)  (consume=1 default)

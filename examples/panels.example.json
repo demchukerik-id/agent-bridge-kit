@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy this to ~/.config/claude-web-bridge/panels.json and edit. Keys are friendly names you'll address with --to <name>; tab_id is the Chrome tab whose Claude side panel that name routes to. Find tab IDs with: python3 daemon/cdp_daemon.py panels",
+  "browser-research": {"to": "browser", "tab_id": 1234567890},
+  "mail-agent":     {"to": "browser", "tab_id": 1234567891}
+}

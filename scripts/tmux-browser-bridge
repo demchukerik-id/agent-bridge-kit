@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# tmux-browser-bridge — naming-parallel wrapper around `browser-bridge`.
+#
+# The bridge's primary CLI is `browser-bridge` (Python). This wrapper exists
+# so the command name parallels `tmux-bridge` for users who think of the
+# browser side panels as "browser tmux panes". It is a thin exec wrapper —
+# every flag, subcommand, and exit code is identical to `browser-bridge`.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec python3 "$here/browser-bridge" "$@"

@@ -1,0 +1,657 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    /* ─────────────────────────────────────────────────────────────────────
+       browser-claude-bridge — operator panel
+       Terminal-HUD theme. Hairline frames, monospace uppercase labels,
+       violet for the one committing action.
+
+       Palette is entirely CSS custom properties so both themes flow through
+       popup.js's inline styles (which reference var(--…), not literals).
+         :root                   -> dark  (default)
+         :root[data-theme=light] -> light (paper terminal)
+       theme.js flips the attribute and persists the choice.
+
+       Every id/class from the original stylesheet is preserved, so popup.js
+       render logic stays untouched.
+       ───────────────────────────────────────────────────────────────────── */
+
+    :root {
+      --bg:        #0e0e0e;
+      --bg-panel:  #151515;
+      --bg-hdr:    #1b1b1b;
+      --bg-hover:  #1e1e1e;
+      --bg-input:  #101010;
+
+      --line:      #333333;
+      --line-soft: #242424;
+
+      --txt:       #e8e8e8;
+      --txt-dim:   #9c9c9c;
+      --txt-dim2:  #787878;
+      --txt-faint: #4a4a4a;
+
+      /* Matte ramps — each step is roughly a 20% lightness move, low chroma
+         so nothing reads as neon. Violet is the accent: it sits opposite
+         because popup.js writes them into inline styles. */
+      /* The "green" ramp is now a neutral one — kept under these names
+         because popup.js writes var(--green*) into its inline styles.
+         Hierarchy is carried by brightness, not hue. */
+      --green-hi:  #ffffff;
+      --green:     #d8d8d8;
+      --green-dim: #6a6a6a;
+      --green-lo:  #3a3a3a;
+
+      --violet-hi: #b3a6dd;
+      --violet:    #9788c6;
+      --violet-dim:#4b4272;
+
+      --cyan:      #6fb6c2;
+      --red:       #c9705f;
+      --red-dim:   #5c322b;
+      --pink:      #c47f9e;
+
+      --green-a07: rgba(255, 255, 255, 0.06);
+      --green-a12: rgba(255, 255, 255, 0.10);
+      --green-a20: rgba(255, 255, 255, 0.16);
+      --cyan-a12:  rgba(111, 182, 194, 0.12);
+      --cyan-a30:  rgba(111, 182, 194, 0.30);
+      --violet-a08: rgba(151, 136, 198, 0.12);
+      --red-a10:   rgba(201, 112, 95, 0.12);
+
+      --glow:      none;
+      --scan:      rgba(255, 255, 255, 0.022);
+      --wash:      rgba(255, 255, 255, 0.04);
+
+      --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+    }
+
+    /* ── light theme: paper terminal ───────────────────────────────────── */
+    :root[data-theme="light"] {
+      --bg:        #eef1ec;
+      --bg-panel:  #fbfcfa;
+      --bg-hdr:    #e4eae4;
+      --bg-hover:  #eff4ee;
+      --bg-input:  #ffffff;
+
+      --line:      #c2cec6;
+      --line-soft: #dde4dd;
+
+      --txt:       #1b2b24;
+      --txt-dim:   #4a6459;
+      --txt-dim2:  #5f7a6d;
+      --txt-faint: #8ba093;
+
+      /* Same matte hues, stepped down for paper. */
+      --green-hi:  #2e5f49;
+      --green:     #3f7a5f;
+      --green-dim: #619a80;
+      --green-lo:  #a6c2b3;
+
+      --violet-hi: #493d78;
+      --violet:    #63549b;
+      --violet-dim:#bfb6da;
+
+      --cyan:      #3f7d88;
+      --red:       #a4503f;
+      --red-dim:   #d9b3aa;
+      --pink:      #9c5772;
+
+      --green-a07: rgba(63, 122, 95, 0.06);
+      --green-a12: rgba(63, 122, 95, 0.11);
+      --green-a20: rgba(63, 122, 95, 0.18);
+      --cyan-a12:  rgba(63, 125, 136, 0.10);
+      --cyan-a30:  rgba(63, 125, 136, 0.32);
+      --violet-a08: rgba(99, 84, 155, 0.11);
+      --red-a10:   rgba(164, 80, 63, 0.10);
+
+      --glow:      none;
+      --scan:      rgba(27, 43, 36, 0.020);
+      --wash:      rgba(63, 122, 95, 0.05);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { background: var(--bg); }
+
+    body {
+      width: 400px;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      color: var(--txt);
+      font-family: var(--mono);
+      font-size: 12px;
+      /* scanlines + top wash */
+      background-image:
+        repeating-linear-gradient(
+          to bottom,
+          var(--scan) 0px, var(--scan) 1px,
+          transparent 1px, transparent 3px
+        ),
+        radial-gradient(120% 60% at 50% 0%, var(--wash), transparent 70%);
+    }
+
+    /* ── title bar ─────────────────────────────────────────────────────── */
+
+    .hdr {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 8px 10px;
+      background: var(--bg-hdr);
+      border-bottom: 1px solid var(--line);
+      position: relative;
+      flex-shrink: 0;
+    }
+    .hdr::before, .hdr::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      width: 7px; height: 7px;
+      border-top: 1px solid var(--green-dim);
+      opacity: 0.85;
+    }
+    .hdr::before { left: 3px;  border-left: 1px solid var(--green-dim); }
+    .hdr::after  { right: 3px; border-right: 1px solid var(--green-dim); }
+
+    .hdr h3 { margin: 0; font-size: 13px; }
+
+    .hdr-title {
+      font-size: 10px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--green);
+      text-shadow: var(--glow);
+      white-space: nowrap;
+    }
+    .hdr-rule {
+      flex: 1;
+      height: 1px;
+      min-width: 8px;
+      background: repeating-linear-gradient(
+        to right, var(--line) 0 4px, transparent 4px 7px
+      );
+    }
+
+    .hdr button {
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.7px;
+      text-transform: uppercase;
+      color: var(--txt-dim);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      padding: 3px 6px;
+      margin: 0;
+      cursor: pointer;
+      transition: color 0.12s, border-color 0.12s, background 0.12s;
+    }
+    .hdr button:hover {
+      color: var(--green);
+      border-color: var(--green-dim);
+      background: var(--green-a07);
+    }
+    .hdr button:active { background: var(--green-a20); }
+    .hdr button#media-fade.on { color: var(--green); border-color: var(--green-dim); }
+
+    .hdr .badge {
+      font-size: 9px;
+      font-family: var(--mono);
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      padding: 3px 6px;
+      border-radius: 0;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--txt-dim);
+      white-space: nowrap;
+    }
+    .hdr .badge.ok {
+      color: var(--green);
+      border-color: var(--green-dim);
+      background: var(--green-a12);
+      text-shadow: var(--glow);
+    }
+    .hdr .badge.err {
+      color: var(--red);
+      border-color: var(--red-dim);
+      background: var(--red-a10);
+    }
+
+    /* ── body scroll region ────────────────────────────────────────────── */
+
+    .panel-body {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 0 10px;
+      overflow-y: auto;
+    }
+
+    /* ── section labels ────────────────────────────────────────────────── */
+
+    .section-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1.7px;
+      color: var(--txt-dim2);
+      margin: 13px 0 5px 0;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-shrink: 0;
+    }
+    .section-label::before {
+      content: "";
+      width: 5px; height: 5px;
+      background: var(--green-dim);
+      transform: rotate(45deg);
+      flex-shrink: 0;
+    }
+    .section-label::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: var(--line-soft);
+    }
+
+    /* ── agent panels ──────────────────────────────────────────────────── */
+
+    .agents {
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: var(--bg-panel);
+      position: relative;
+      flex-shrink: 0;
+    }
+    /* bracket ticks on the two lower corners of each panel */
+    .agents::before, .agents::after {
+      content: "";
+      position: absolute;
+      bottom: -1px;
+      width: 6px; height: 6px;
+      border-bottom: 1px solid var(--green-dim);
+      opacity: 0.7;
+      pointer-events: none;
+    }
+    .agents::before { left: -1px;  border-left: 1px solid var(--green-dim); }
+    .agents::after  { right: -1px; border-right: 1px solid var(--green-dim); }
+
+    #agents       { min-height: 58px; }
+
+    .agent-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 7px;
+      font-size: 11px;
+      color: var(--txt);
+      transition: background 0.12s;
+    }
+    .agent-row:hover { background: var(--bg-hover); }
+    .agent-row + .agent-row { border-top: 1px solid var(--line-soft); }
+
+    .agent-name {
+      font-family: var(--mono);
+      font-weight: 600;
+      color: var(--txt);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      /* takes the leftover width so the pairing + context columns are
+         pinned to the right edge of the row */
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .agent-title {
+      flex: 1;
+      color: var(--txt-dim);
+      font-size: 10px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .agent-tab {
+      color: var(--txt-faint);
+      font-size: 9px;
+      font-family: var(--mono);
+      margin-left: auto;
+    }
+
+    /* Copy glyph — click copies the tab id. Fixed width and a same-width
+       glyph swap on success, so the row never reflows while confirming. */
+    .agent-short {
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1;
+      color: var(--cyan);
+      cursor: pointer;
+      width: 14px;
+      text-align: center;
+      flex-shrink: 0;
+      user-select: none;
+      transition: color 0.12s, text-shadow 0.12s;
+    }
+    .agent-short:hover { color: var(--green); }
+    .agent-short.copied {
+      color: var(--green-hi);
+      text-shadow: 0 0 6px var(--green-a20);
+    }
+
+    /* pairing readout: which terminal agent gets this agent's replies */
+    .agent-link {
+      font-size: 10px;
+      font-family: var(--mono);
+      color: var(--green);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 132px;
+    }
+    .agent-link.off { color: var(--txt-faint); font-style: italic; }
+    .agent-link:empty { display: none; }
+
+    /* estimated context fill — text only, deliberately not a precise number */
+    .agent-ctx {
+      font-size: 10px;
+      font-family: var(--mono);
+      color: var(--txt-dim2);
+      width: 34px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .agent-ctx.warm { color: var(--violet); }
+    .agent-ctx.hot  { color: var(--red); }
+
+    .agent-relay { display: flex; align-items: center; gap: 3px; cursor: pointer; user-select: none; }
+    .agent-relay input {
+      width: 11px; height: 11px; margin: 0; cursor: pointer;
+      accent-color: var(--green-dim);
+    }
+    .agent-relay-label {
+      font-size: 9px;
+      font-family: var(--mono);
+      letter-spacing: 0.5px;
+      color: var(--txt-dim2);
+      width: 20px;
+      text-align: left;
+    }
+    .agent-relay-label.on  { color: var(--green); }
+    .agent-relay-label.off { color: var(--red); }
+
+    .agent-target { font-size: 10px; font-family: var(--mono); }
+    .agent-target select {
+      font-size: 9px;
+      font-family: var(--mono);
+      padding: 2px 16px 2px 4px;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: var(--bg-input);
+      color: var(--txt-dim);
+      max-width: 104px;
+      cursor: pointer;
+      text-overflow: ellipsis;
+    }
+    .agent-target select:hover { border-color: var(--green-dim); color: var(--txt); }
+    .agent-target select.overridden {
+      border-color: var(--cyan);
+      background: var(--cyan-a12);
+      color: var(--cyan);
+    }
+    .agent-target select option { background: var(--bg-input); color: var(--txt); }
+
+    /* ── status dots ───────────────────────────────────────────────────── */
+
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--txt-faint);
+    }
+    /* Dot states:
+       .responding (pink)  — task currently in flight to this chat
+       .active     (cyan)  — recent reply (within last ~15s)
+       .idle       (violet) — registered & open, no recent activity
+       .discovered (green) — tab group exists but isn't a registered agent
+       .dead       (red)   — registered but tab is gone */
+    .dot.responding { background: var(--pink); box-shadow: 0 0 0 0 rgba(255, 102, 178, 0.8); animation: pulse-pink 1.0s ease-out infinite; }
+    .dot.active     { background: var(--cyan); box-shadow: 0 0 0 0 rgba(79, 214, 232, 0.7); animation: pulse-blue 1.4s ease-out infinite; }
+    .dot.idle       { background: #6a6a6a; box-shadow: none; }
+    .dot.discovered { background: var(--violet-hi); box-shadow: 0 0 0 0 rgba(179, 166, 221, 0.7); animation: pulse-violet 2.4s ease-out infinite; }
+    .dot.dead       { background: var(--red); box-shadow: 0 0 5px rgba(255, 95, 86, 0.5); }
+
+    @keyframes pulse-pink {
+      0%   { box-shadow: 0 0 0 0    rgba(255, 102, 178, 0.8); }
+      70%  { box-shadow: 0 0 0 11px rgba(255, 102, 178, 0); }
+      100% { box-shadow: 0 0 0 0    rgba(255, 102, 178, 0); }
+    }
+    @keyframes pulse-blue {
+      0%   { box-shadow: 0 0 0 0    rgba(79, 214, 232, 0.7); }
+      70%  { box-shadow: 0 0 0 10px rgba(79, 214, 232, 0); }
+      100% { box-shadow: 0 0 0 0    rgba(79, 214, 232, 0); }
+    }
+    @keyframes pulse-violet {
+      0%   { box-shadow: 0 0 0 0   rgba(179, 166, 221, 0.6); }
+      70%  { box-shadow: 0 0 0 8px rgba(179, 166, 221, 0); }
+      100% { box-shadow: 0 0 0 0   rgba(179, 166, 221, 0); }
+    }
+
+    /* Collapsed tab group = hidden in the tab strip. Dim it so the open
+       chat is the one that reads as live. */
+    .dot.collapsed { opacity: 0.38; }
+    .dot.expanded  { opacity: 1; box-shadow: 0 0 0 1px rgba(255,255,255,0.28); }
+
+    .agent-row.discovered .agent-name { color: var(--violet); font-style: italic; }
+    .agent-row.discovered { background: var(--violet-a08); }
+
+    /* ── inline editors + row controls ─────────────────────────────────── */
+
+    .pane-rename {
+      width: 84px;
+      padding: 2px 5px;
+      font: 10px var(--mono);
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: var(--bg-input);
+      color: var(--txt);
+    }
+    .pane-rename:focus {
+      outline: none;
+      border-color: var(--green-dim);
+      box-shadow: 0 0 0 1px var(--green-a20);
+    }
+    .pane-rename.invalid {
+      border-color: var(--red);
+      background: var(--red-a10);
+      color: var(--red);
+    }
+    .pane-star, .pane-delete, .pane-copy-resume { transition: filter 0.12s, opacity 0.12s; }
+    .pane-star:hover, .pane-delete:hover, .pane-copy-resume:hover { filter: brightness(1.4); }
+
+    .agent-row.flash-ok {
+      background: var(--green-a20);
+      transition: background 0.5s ease-out;
+    }
+    .ago-live { color: var(--txt-faint); font-family: var(--mono); }
+
+
+    /* ── collapsibles ──────────────────────────────────────────────────── */
+
+    details { margin-top: 0; font-size: 11px; }
+    details > summary {
+      cursor: pointer;
+      color: var(--txt-dim);
+      font-size: 10px;
+      user-select: none;
+    }
+    details > summary::marker { color: var(--txt-faint); }
+    details > summary:hover { color: var(--green); }
+
+    #settings-details { margin-top: 13px; flex-shrink: 0; }
+
+    /* One header treatment shared by BROWSER AGENTS and BEARER TOKEN:
+       diamond, letter-spaced caps, rule to the right edge, count last.
+       Collapsible sections use the diamond as the open/closed cue instead
+       of a caret, so the headers look identical. */
+    details > summary.section-label {
+      list-style: none;
+      cursor: pointer;
+      margin: 0 0 5px 0;
+      padding: 0;
+    }
+    details > summary.section-label::-webkit-details-marker { display: none; }
+    details > summary.section-label:hover { color: var(--green); }
+    details:not([open]) > summary.section-label::before {
+      background: transparent;
+      box-shadow: inset 0 0 0 1px var(--green-dim);
+    }
+    .section-label .count {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--txt-dim2);
+      letter-spacing: 0;
+      order: 99;
+    }
+    .section-label::after { order: 98; }
+
+    /* bodies of the collapsible sections match the .agents box */
+    .section-body {
+      border: 1px solid var(--line);
+      background: var(--bg-panel);
+      padding: 8px;
+    }
+
+    .config {
+      padding: 9px;
+      border: 1px solid var(--line);
+      background: var(--bg-panel);
+      margin-top: 4px;
+    }
+    .config label {
+      display: block;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1.3px;
+      color: var(--txt-dim2);
+      margin: 0 0 5px 0;
+    }
+    .config input[type=text] {
+      width: 100%;
+      padding: 6px;
+      font-family: var(--mono);
+      font-size: 11px;
+      background: var(--bg-input);
+      border: 1px solid var(--line);
+      border-radius: 0;
+      color: var(--green);
+      caret-color: var(--green);
+    }
+    .config input[type=text]:focus {
+      outline: none;
+      border-color: var(--green-dim);
+      box-shadow: 0 0 0 1px var(--green-a20);
+    }
+    .config input[type=text]::placeholder { color: var(--txt-faint); }
+    /* brief confirmation that the token actually hit storage */
+    .config input[type=text].saved {
+      border-color: var(--green);
+      box-shadow: 0 0 0 1px var(--green-a20);
+    }
+
+    .config-row { display: flex; gap: 6px; margin-top: 8px; }
+    .config-row button {
+      flex: 1;
+      padding: 6px 4px;
+      font-family: var(--mono);
+      font-size: 9px;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: var(--txt-dim);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      cursor: pointer;
+      transition: color 0.12s, border-color 0.12s, background 0.12s;
+    }
+    .config-row button:hover {
+      color: var(--green);
+      border-color: var(--green-dim);
+      background: var(--green-a07);
+    }
+    /* Save is the committing action — green, weighted heavier than its
+       neighbours so it reads as the primary button. */
+    .config-row button#save {
+      color: var(--green-hi);
+      border-color: var(--green-dim);
+      background: var(--green-a07);
+    }
+    .config-row button#save:hover {
+      color: var(--green-hi);
+      border-color: var(--green);
+      background: var(--green-a12);
+    }
+
+    /* pushes the footer to the bottom when content is short */
+    .spacer { flex: 1; min-height: 4px; }
+
+    /* ── footer readout ────────────────────────────────────────────────── */
+
+    .footer {
+      font-size: 9px;
+      letter-spacing: 0.6px;
+      color: var(--txt-faint);
+      margin: 0 10px;
+      padding: 7px 0 9px 0;
+      border-top: 1px solid var(--line-soft);
+      font-family: var(--mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex-shrink: 0;
+    }
+
+    /* ── scrollbars ────────────────────────────────────────────────────── */
+
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--line); }
+    ::-webkit-scrollbar-thumb:hover { background: var(--green-dim); }
+  </style>
+</head>
+<body>
+  <div class="hdr">
+    <span class="hdr-title">BRIDGE//OPS</span>
+    <span class="hdr-rule"></span>
+    <button id="theme-toggle" title="Switch theme">LGT</button>
+    <button id="media-fade" title="Media fade: keeps videos playing at a lower volume while you work in another app.">FADE</button>
+    <button id="open-dashboard" title="Open the full localhost dashboard in a new tab (richer UI, all themes)">DASH</button>
+    <span id="status-badge" class="badge">…</span>
+  </div>
+
+  <div class="panel-body">
+    <div class="section-label">Browser agents</div>
+    <div id="agents" class="agents"><div class="agent-row" style="color:var(--txt-faint)">loading…</div></div>
+
+    <details id="settings-details">
+      <summary class="section-label">Bearer token</summary>
+      <div class="config">
+        <input id="token" type="text" placeholder="paste token" />
+        <div class="config-row">
+          <button id="save">Save</button>
+        </div>
+      </div>
+    </details>
+
+    <div class="spacer"></div>
+  </div>
+
+  <script src="theme.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

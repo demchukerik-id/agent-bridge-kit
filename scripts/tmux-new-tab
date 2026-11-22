@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# tmux-new-tab — ask the bridge server to open a brand-new Chrome tab.
+#
+# Mirrors browser-bridge's get_sender() convention: prefer $TMUX_PANE so the
+# server can route the next discovered panel's replies back to this exact
+# tmux pane. Outside tmux, fall back to a virtual:<host>:<pid> identity.
+#
+# After Chrome opens the tab, the operator clicks the Claude extension icon
+# on the new tab and starts a chat. The bridge's existing panel-discovery
+# flow registers the panel and (per the from_pane hint) routes replies here.
+set -euo pipefail
+
+FROM_PANE="${TMUX_PANE:-virtual:$(hostname):$$}"
+TOKEN_FILE="${HOME}/.config/claude-web-bridge/token"
+ACTION="open"
+if [[ "${1:-}" == "--cancel" ]]; then
+  ACTION="cancel"
+fi
+
+if [[ ! -r "$TOKEN_FILE" ]]; then
+  echo "tmux-new-tab: cannot read bridge token at $TOKEN_FILE" >&2
+  exit 1
+fi
+TOK="$(cat "$TOKEN_FILE")"
+
+if [[ "$ACTION" == "cancel" ]]; then
+  URL="${BRIDGE_URL:-http://127.0.0.1:7777}/browser/cancel-claim"
+else
+  URL="${BRIDGE_URL:-http://127.0.0.1:7777}/browser/open-tab"
+fi
+
+# Capture body + status separately so we can branch on HTTP code without
+# losing the response payload for error reporting.
+TMP_BODY="$(mktemp)"
+trap 'rm -f "$TMP_BODY"' EXIT
+
+HTTP_CODE="$(curl -sS -o "$TMP_BODY" -w '%{http_code}' \
+  -X POST \
+  -H "Authorization: Bearer $TOK" \
+  -H "Content-Type: application/json" \
+  -d "{\"from_pane\":\"$FROM_PANE\"}" \
+  "$URL" || echo "000")"
+
+if [[ "$HTTP_CODE" == "200" ]]; then
+  if [[ "$ACTION" == "cancel" ]]; then
+    echo "[ok] pending claim(s) for $FROM_PANE cleared."
+  else
+    cat <<EOF
+[ok] new tab opened. To register the chat with this pane ($FROM_PANE):
+  1. Click the Claude for Chrome extension icon on the new tab.
+  2. The side panel opens — type a prompt and PRESS SEND.
+  3. Sending the first prompt spawns a claude.ai conversation tab, which is
+     when the bridge sees a new tab group and auto-routes replies back here.
+Just opening the side panel WITHOUT sending a prompt won't register the chat —
+the bridge only detects chats that materialize a tab group.
+Pending claim has a 5-min TTL. Run \`tmux-new-tab --cancel\` to clear it early.
+EOF
+  fi
+  exit 0
+fi
+
+echo "tmux-new-tab: server returned HTTP $HTTP_CODE" >&2
+cat "$TMP_BODY" >&2
+echo >&2
+exit 1

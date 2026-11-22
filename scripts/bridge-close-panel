@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""bridge-close-panel — close a Claude panel's whole tab group, optionally deleting the chat first.
+
+    bridge-close-panel <tab_id>            close the group, the chat stays saved
+    bridge-close-panel <tab_id> --delete   delete the chat, then close the group
+    bridge-close-panel <tab_id> --delete --no-raise
+                                           as --delete, but exit 3 instead of
+                                           touching what the user is looking at
+
+Agents call it through `browser-bridge close-panel <target>` and
+`browser-bridge delete-chat <target>`, which resolve /brN or a name to the
+tab_id and drop the panel from panels.json afterwards.
+
+Closing. Claude for Chrome puts the panel's tab and every tab it opens in one
+Chrome tab group. The group is read and closed from the extension's service
+worker, which keeps running after the tabs are gone, so the result is checked
+in the same call. A tab outside any group is closed on its own.
+
+Deleting. The same clicks the user makes, inside the panel's claude.ai iframe:
+the chat title's "More options" arrow, D (the menu's Delete shortcut), then
+Delete in the "Delete task" dialog. Done when the iframe leaves the task URL.
+Refused while the panel is still answering. Keys and JS clicks only: any
+Input mousePressed in this iframe can drop the CDP socket (seen on the menu,
+the dialog and the trigger), so the trigger is focused and opened with ArrowDown,
+and Delete is reached by its D key (the labels start with an icon glyph).
+Keys go to the page over CDP. A panel that is not drawing never finishes
+opening the menu: its tab is made active first, and if the window is covered
+(Chrome started without the occlusion flags) the window is raised, focus
+only, no Windows keys (windows/window-keys.ps1).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _panel_cdp import (EXT_ID, default_account, resolve_account, cdp_host, connect, evaluate, panel_ids, targets,  # noqa: E402
+                        wait_for, window_keys, window_name)
+from _panel_cdp import die as _die  # noqa: E402
+
+PROG = "bridge-close-panel"
+# Resolves "fired" when the page draws a frame. A covered bridge window whose
+# Chrome lacks --disable-backgrounding-occluded-windows reads hidden and draws
+# nothing, and then the menu and dialog never finish their animations.
+DRAWS = """new Promise(r => { let ok = false; requestAnimationFrame(() => { ok = true; r(true) });
+  setTimeout(() => { if (!ok) r(false) }, 700) })"""
+TRIGGER = "document.querySelector('[aria-label^=\"More options for \"]')"
+MENU_OPEN = "document.querySelectorAll('[role=menuitem]').length > 0"
+DELETE_ITEM = "[...document.querySelectorAll('[role=menuitem]')].find(m => m.innerText.split('\\n').map(s => s.trim()).includes('Delete'))"
+CONFIRM = "[...document.querySelectorAll('[role=alertdialog] button')].find(b => b.innerText.trim() === 'Delete')"
+
+
+DEFERRED = 3  # --no-raise: not done now, nothing changed, try later
+
+
+def die(msg: str) -> None:
+    _die(PROG, msg)
+
+
+def defer(msg: str) -> None:
+    print(f"{PROG}: deferred: {msg}", file=sys.stderr)
+    sys.exit(DEFERRED)
+
+
+def chat_frame(host: str, tab_id: int) -> dict | None:
+    ts = targets(host)
+    panel = next((t for t in ts if t["url"].startswith(f"chrome-extension://{EXT_ID}/sidepanel.html?tabId={tab_id}")), None)
+    if not panel:
+        return None
+    return next((t for t in ts if t.get("parentId") == panel["id"] and t["url"].startswith("https://claude.ai/")), None)
+
+
+def key(c, name: str, code: str, vk: int, text: str) -> None:
+    """One key press delivered to the page over CDP (never to Windows)."""
+    c.send_command("Input.dispatchKeyEvent",
+                   {"type": "keyDown", "key": name, "code": code, "windowsVirtualKeyCode": vk, "text": text})
+    c.send_command("Input.dispatchKeyEvent",
+                   {"type": "keyUp", "key": name, "code": code, "windowsVirtualKeyCode": vk})
+
+
+def delete_chat(host: str, tab_id: int, account: str, no_raise: bool = False,
+                expect_chat: str | None = None) -> str:
+    frame = chat_frame(host, tab_id)
+    if not frame:
+        die(f"tab {tab_id} has no open Claude side panel")
+    w = None
+    if no_raise:
+        # The 5 h sweep runs unattended. It must not change the user's screen:
+        # no delete while he looks at this tab, no tab switch in the window
+        # he is using, no raise. A tab switch in an unfocused, unminimized
+        # window is allowed, since a panel draws only on its active tab.
+        w = json.loads(in_worker(host, WINDOW_STATE % (tab_id, tab_id)) or "null")
+        if not w:
+            defer("could not read the panel's window state")
+        if w["focused"] and w["active"]:
+            defer("The user's focused window shows this tab")
+    c = connect(host, frame)
+    try:
+        ev = lambda js: evaluate(c, js)  # noqa: E731
+        url = ev("location.href")
+        stop = lambda why: defer(why) if no_raise else die(why)  # noqa: E731
+
+        def check_chat_and_idle():
+            # The chat this run was asked to delete, and not answering. Run
+            # first and again right before the Delete click: a reply can start
+            # while the menu and dialog open (A3F2).
+            if expect_chat and f"/task/{expect_chat}" not in ev("location.href"):
+                stop(f"the panel no longer shows chat {expect_chat}")
+            if ev("!!document.querySelector('[data-testid=chat-input-stop]')"):
+                stop("the panel is still answering. Wait for the reply, or stop it, then retry.")
+
+        if expect_chat and f"/task/{expect_chat}" not in url:
+            stop(f"the panel shows {url.rsplit('/', 1)[-1][:40]}, not chat {expect_chat}")
+        if "/task/" not in url or url.endswith("/task/new"):
+            return "no chat to delete"
+        check_chat_and_idle()
+        if no_raise:
+            # Never raise under --no-raise, whatever DRAWS does later (A3F1):
+            # this branch replaces the raising one below.
+            if not ev(DRAWS):
+                if w["focused"] or w["state"] == "minimized":
+                    defer(f"the panel is not drawing and its window is {'focused' if w['focused'] else 'minimized'}")
+                in_worker(host, ACTIVATE % tab_id)
+                if not wait_for(lambda: ev(DRAWS), 2):
+                    defer("the panel is still not drawing after its tab was made active")
+        elif not ev(DRAWS):
+            # A side panel draws only while its own tab is the active one, and
+            # the agent's work often leaves another tab active. Activate it.
+            # If it still draws nothing the window is covered (Chrome without
+            # the occlusion flags), so raise it, focus only, no keys pressed.
+            in_worker(host, ACTIVATE % tab_id)
+            if not wait_for(lambda: ev(DRAWS), 2):
+                err = window_keys(window_name(account), [])
+                if err or not wait_for(lambda: ev(DRAWS), 2):
+                    die(f"the panel is not drawing and could not be brought up: {err or 'still hidden'}")
+        if not ev(f"!!{CONFIRM}"):  # a dialog left open by an earlier run is reused
+            if ev(MENU_OPEN):
+                key(c, "Escape", "Escape", 27, "")
+                wait_for(lambda: not ev(MENU_OPEN), 2)
+            if not ev(f"(e => !!e && (e.focus(), document.activeElement === e))({TRIGGER})"):
+                die("chat title menu not found in the panel")
+            key(c, "ArrowDown", "ArrowDown", 40, "")
+            if not wait_for(lambda: ev(MENU_OPEN), 3):
+                die("chat title menu did not open")
+            # Focus moves into the menu a beat after it renders. A D pressed
+            # before that lands on the trigger and does nothing, so wait, and
+            # fall back to focusing the Delete item directly.
+            if not wait_for(lambda: ev("!!document.activeElement.closest('[role=menu]')"), 1):
+                ev(f"{DELETE_ITEM}.focus()")
+            key(c, "d", "KeyD", 68, "d")
+            if not wait_for(lambda: ev(f"!!{CONFIRM}"), 3):
+                ev(f"{DELETE_ITEM}.focus()")
+                key(c, "Enter", "Enter", 13, "\r")
+            if not wait_for(lambda: ev(f"!!{CONFIRM}"), 5):
+                die("the Delete confirmation did not appear")
+        try:
+            check_chat_and_idle()
+        except SystemExit:
+            key(c, "Escape", "Escape", 27, "")  # leave no dialog open
+            raise
+        ev(f"{CONFIRM}.click()")
+        if not wait_for(lambda: ev("location.href") != url, 6):
+            die("clicked Delete but the chat is still open")
+        return f"deleted {url.rsplit('/', 1)[-1]}"
+    finally:
+        c.close()
+
+
+# Runs in the extension's service worker: find the tab's group, close every
+# tab in it, then report which of those tabs still exist (should be none).
+CLOSE_GROUP = """(async () => {
+  let t;
+  try { t = await chrome.tabs.get(%d); } catch (e) { return null; }
+  // Tabs hosting another Claude panel. A group can hold two panels after
+  // The user merges groups; then which task tab belongs to which panel is
+  // unknown, so only this panel's own tab closes (A3F5).
+  const otherHosts = new Set(%s);
+  let ids = t.groupId >= 0 ? (await chrome.tabs.query({groupId: t.groupId})).map(x => x.id) : [t.id];
+  const shared = ids.some(id => otherHosts.has(id));
+  if (shared) ids = [t.id];
+  // Never close a window's last tabs: with the bridge window as Chrome's only
+  // window that quit the whole bridge Chrome (2026-10-04). Leave a blank tab.
+  const inWindow = await chrome.tabs.query({windowId: t.windowId});
+  if (inWindow.every(x => ids.includes(x.id))) {
+    await chrome.tabs.create({windowId: t.windowId, url: 'chrome://newtab/', active: false});
+  }
+  await chrome.tabs.remove(ids);
+  const left = (await chrome.tabs.query({})).filter(x => ids.includes(x.id)).map(x => x.id);
+  return JSON.stringify({grouped: t.groupId >= 0 && !shared, shared, closed: ids, left});
+})()"""
+
+
+ACTIVATE = "chrome.tabs.update(%d, {active: true}).then(() => 'ok', () => null)"
+WINDOW_STATE = """chrome.tabs.get(%d).then(t => chrome.windows.get(t.windowId))
+  .then(w => chrome.tabs.get(%d).then(t => JSON.stringify({focused: w.focused, state: w.state, active: t.active})),
+        () => null)"""
+
+
+def in_worker(host: str, js: str):
+    """Run js in Claude for Chrome's service worker. There is one per profile
+    and only the tab's own profile can see the tab, so the first non-null
+    result wins. The worker keeps running when tabs close, unlike the panel."""
+    workers = [t for t in targets(host) if t["type"] == "service_worker"
+               and t["url"].startswith(f"chrome-extension://{EXT_ID}/")]
+    if not workers:
+        die("Claude for Chrome's service worker is not running")
+    for w in workers:
+        c = connect(host, w)
+        try:
+            res = evaluate(c, js)
+        finally:
+            c.close()
+        if res:
+            return res
+    return None
+
+
+def mark_closing(tab_id: int) -> None:
+    """Tell the server this close is on purpose, so it posts no "closed"
+    notice into the owning pane. Best effort."""
+    import os, urllib.request
+    try:
+        tok = (Path.home() / ".config/claude-web-bridge/token").read_text().strip()
+        url = os.environ.get("CLAUDE_BRIDGE_URL", "http://127.0.0.1:7777") + "/panels/closing"
+        req = urllib.request.Request(url, data=json.dumps({"tab_id": int(tab_id)}).encode(), method="POST",
+                                     headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=3)
+    except OSError:
+        pass
+
+
+def close_group(host: str, tab_id: int) -> dict:
+    mark_closing(tab_id)
+    others = sorted(int(t) for t in panel_ids(host) if t.isdigit() and int(t) != tab_id)
+    raw = in_worker(host, CLOSE_GROUP % (tab_id, json.dumps(others)))
+    if not raw:
+        die(f"tab {tab_id} is not open in the bridge Chrome")
+    res = json.loads(raw)
+    if res["left"]:
+        die(f"tabs still open after close: {res['left']}")
+    return res
+
+
+# ---- deleting chats picked from Recent tasks (browser-bridge delete-tasks) ----
+PANEL_HOME = "https://claude.ai/cic/new?surface=cic_sidepanel"
+RECENT = "document.querySelector('button[aria-label=\"Recent tasks\"]')"
+
+
+def frame_eval(host: str, tab_id: int, js: str):
+    frame = chat_frame(host, tab_id)
+    if not frame:
+        die(f"tab {tab_id} has no open Claude side panel")
+    c = connect(host, frame)
+    try:
+        return evaluate(c, js)
+    finally:
+        c.close()
+
+
+def panels_showing(host: str) -> dict[str, int]:
+    """cse id -> tab id, for every open panel whose chat is that task."""
+    ts = targets(host)
+    out = {}
+    for p in ts:
+        if not p["url"].startswith(f"chrome-extension://{EXT_ID}/sidepanel.html?tabId="):
+            continue
+        for f in ts:
+            if f.get("parentId") == p["id"] and "/task/cse_" in f["url"]:
+                out[f["url"].split("/task/")[1].split("?")[0]] = int(p["url"].split("tabId=")[1].split("&")[0])
+    return out
+
+
+def open_task(host: str, tab_id: int, cse: str) -> bool:
+    """Show task `cse` in the panel by clicking it in Recent tasks, as the user does."""
+    href = f"/cic/task/{cse}"
+    ev = lambda js: frame_eval(host, tab_id, js)  # noqa: E731
+    # A panel open-panel just returned has no chat frame for a second or two.
+    if not wait_for(lambda: chat_frame(host, tab_id), 15):
+        die(f"tab {tab_id} has no open Claude side panel")
+    # After a delete the frame sits on claude.ai/task/new, which has no Recent tasks button.
+    if not ev("location.pathname").startswith("/cic/"):
+        ev(f"location.href = '{PANEL_HOME}'; 1")
+    if not wait_for(lambda: ev(f"!!{RECENT}"), 10):
+        die("Recent tasks button not found in the panel")
+    # Right after a delete the reloaded page draws the button before it reacts
+    # to clicks, and a lost click skipped every second chat (2026-10-04). Click
+    # until the dialog is open.
+    def dialog_open():
+        if ev("!!document.querySelector('[role=dialog]')"):
+            return True
+        ev(f"(b => b && b.click())({RECENT}); 1")
+        return wait_for(lambda: ev("!!document.querySelector('[role=dialog]')"), 1.5)
+    if not wait_for(dialog_open, 12, 0.5):
+        die("Recent tasks would not open in the panel")
+    if not wait_for(lambda: ev(f"!!document.querySelector('[role=dialog] a[href=\"{href}\"]')"), 8):
+        ev("(b => b && b.click())(document.querySelector('[role=dialog] button[aria-label=Close]')); 1")
+        return False
+    ev(f"document.querySelector('[role=dialog] a[href=\"{href}\"]').click(); 1")
+    if not wait_for(lambda: ev("location.pathname") == href, 6):
+        return False
+    ev("(b => b && b.click())(document.querySelector('[role=dialog] button[aria-label=Close]')); 1")
+    wait_for(lambda: not ev("!!document.querySelector('[role=dialog]')"), 3)
+    time.sleep(1)
+    return True
+
+
+def delete_tasks(host: str, ids: list[str], account: str) -> int:
+    """Delete each chat, then close the tab group it was open in. A chat open in
+    some panel is deleted there and that panel's group closes. The rest are
+    deleted in one new panel, whose group closes at the end."""
+    failed = 0
+    showing = panels_showing(host)
+    rest = []
+    for cse in ids:
+        tab = showing.get(cse)
+        if tab is None:
+            rest.append(cse)
+            continue
+        print(f"{cse}: {delete_chat(host, tab, account)}, open in tab {tab}")
+        res = close_group(host, tab)
+        print(f"  closed its tab group ({len(res['closed'])} tabs)")
+        forget_panel(tab)
+    if rest:
+        r = subprocess.run([str(Path(__file__).resolve().parent / "bridge-open-panel"), "--account", account],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"could not open a panel to delete from: {r.stderr.strip() or r.stdout.strip()}")
+        tab = int(r.stdout.strip().splitlines()[-1])
+        try:
+            for cse in rest:
+                if not open_task(host, tab, cse):
+                    print(f"{cse}: not found in Recent tasks, skipped")
+                    failed += 1
+                    continue
+                print(f"{cse}: {delete_chat(host, tab, account)}")
+        finally:
+            res = close_group(host, tab)
+            print(f"closed the working panel's tab group ({len(res['closed'])} tabs)")
+            forget_panel(tab)
+    return 1 if failed else 0
+
+
+def forget_panel(tab_id: int) -> None:
+    """Drop the closed panel from panels.json, same as browser-bridge _close_panel."""
+    subprocess.run(["browser-bridge", "forget", str(tab_id)], capture_output=True)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("tab_id", type=int, nargs="?")
+    ap.add_argument("--delete", action="store_true", help="delete the chat before closing the group")
+    ap.add_argument("--tasks", nargs="+", metavar="CSE_ID",
+                    help="delete these chats (ids from Recent tasks) and close the groups they were open in")
+    ap.add_argument("--no-raise", action="store_true",
+                    help="with --delete: exit 3 instead of raising the window or switching the tab the user sees")
+    ap.add_argument("--expect-chat", metavar="CSE_ID",
+                    help="with --delete: only delete if the panel still shows this chat")
+    ap.add_argument("--account", default=default_account(),
+                    help="bridge window to raise if the panel is covered and not drawing")
+    a = ap.parse_args()
+    a.account = resolve_account(a.account)
+
+    host = cdp_host()
+    if not host:
+        die("bridge Chrome is not reachable. Run bridge-ready first.")
+    if a.tasks:
+        return delete_tasks(host, a.tasks, a.account)
+    if a.tab_id is None:
+        die("give a tab_id, or --tasks")
+    if a.delete:
+        print(delete_chat(host, a.tab_id, a.account, no_raise=a.no_raise, expect_chat=a.expect_chat))
+    res = close_group(host, a.tab_id)
+    what = (f"tab group ({len(res['closed'])} tabs)" if res["grouped"]
+            else "its own tab only (the group holds another panel)" if res.get("shared")
+            else "tab (not in a group)")
+    print(f"closed {what}: {', '.join(map(str, res['closed']))}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

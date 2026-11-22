@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy to ~/.config/claude-web-bridge/accounts.json. default: the Chrome account open-panel uses when --account is not given. window_names: only needed when a bridge window title is not '<name>@ - bridge pfl'. aliases: short names accepted by --account.",
+  "default": "you@example.com",
+  "window_names": {},
+  "aliases": {"login": "you@work.example"}
+}

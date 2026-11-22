@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# bridge-doctor — one-shot health check for the browser-claude-bridge.
+# Designed to make "why didn't the message arrive?" a one-command diagnosis.
+#
+# Usage:
+#   bridge-doctor                  run all checks
+#   bridge-doctor --ping /brN      also do a live ping round-trip (60s timeout)
+#   bridge-doctor -v               verbose (print full payloads on FAIL)
+
+set -uo pipefail
+KIT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+PING_TARGET=""
+VERBOSE=0
+DO_FIX=0
+for arg in "$@"; do
+  case "$arg" in
+    --ping) shift; PING_TARGET="${1:-}"; shift ;;
+    --ping=*) PING_TARGET="${arg#*=}"; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    --fix) DO_FIX=1; shift ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+  esac
+done
+
+# colors (defined before --fix block — fix functions use ${B}/${X})
+if [[ -t 1 ]]; then
+  G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; D=$'\e[2m'; B=$'\e[1m'; X=$'\e[0m'
+else G=; R=; Y=; D=; B=; X=; fi
+
+# --fix: auto-recover known failures BEFORE running checks
+fix_forwarder() {
+  echo "${B}[fix]${X} restarting Windows forwarder..."
+  # kill ALL existing Windows processes listening on 9334 first — SO_REUSEADDR lets
+  # duplicates stack, and stacked forwarders steal connections / break CDP.
+  powershell.exe -NoProfile -Command \
+    "Get-NetTCPConnection -LocalPort 9334 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }" \
+    >/dev/null 2>&1
+  sleep 1
+  . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_winenv.sh"
+  cmd.exe /c start "" /B python "${WIN_LOCALAPPDATA}\\chrome-debug-forwarder.py" >/dev/null 2>&1 &
+  sleep 3
+}
+fix_daemon() {
+  echo "${B}[fix]${X} restarting CDP daemon..."
+  pkill -f "cdp_daemon.py" 2>/dev/null
+  sleep 1
+  setsid env CDP_HOST="$CDP_HOST" CDP_PORT="$CDP_PORT" systemd-run --user --scope --quiet --collect sh -c 'exec "$@"' sh python3 "$KIT_DIR/daemon/cdp_daemon.py" run >/tmp/cdp_daemon.log 2>&1 </dev/null & disown
+  sleep 3
+}
+fix_overrides() {
+  [[ -z "${TMUX_PANE:-}" ]] && return
+  [[ -z "${TOKEN:-}" ]] && TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+  [[ -z "$TOKEN" ]] && return
+  echo "${B}[fix]${X} re-pointing relay overrides at ${TMUX_PANE}..."
+  # find every tab_id with an existing override (the live, addressable side panels)
+  TABS=$(curl -sf -m 3 -H "Authorization: Bearer $TOKEN" "${BRIDGE_URL}/relay-target" 2>/dev/null \
+    | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin).get('overrides', {}).keys()))" 2>/dev/null)
+  for TAB in $TABS; do
+    curl -sf -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "{\"tab_id\":${TAB},\"target\":\"${TMUX_PANE}\",\"by\":\"bridge-doctor-fix\"}" \
+      "${BRIDGE_URL}/relay-target" >/dev/null 2>&1
+  done
+}
+fix_server() {
+  echo "${B}[fix]${X} starting bridge server (detached)..."
+  ( cd "$KIT_DIR" && \
+    setsid env CDP_HOST="$CDP_HOST" CDP_PORT="$CDP_PORT" \
+      nohup systemd-run --user --scope --quiet --collect sh -c 'exec "$@"' sh python3 server/server.py >/tmp/bridge.log 2>&1 </dev/null & disown )
+  sleep 2
+}
+
+if (( DO_FIX )); then
+  # Read these once before fix actions
+  CDP_HOST="${CDP_HOST:-$(ip route show default 2>/dev/null | awk '{print $3}')}"
+  CDP_HOST="${CDP_HOST:-127.0.0.1}"
+  CDP_PORT="${CDP_PORT:-9334}"
+  BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:7777}"
+  TOKEN_FILE="${HOME}/.config/claude-web-bridge/token"
+
+  # server check (--fix used to leave a dead server down; daemon polls it, so first)
+  if ! curl -sf -m 2 "${BRIDGE_URL}/health" 2>/dev/null | grep -q '"ok": *true'; then
+    fix_server
+  fi
+
+  # forwarder check
+  if ! curl -sf -m 2 "http://${CDP_HOST}:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+    fix_forwarder
+  fi
+  # daemon check
+  if ! pgrep -f "cdp_daemon.py" >/dev/null; then
+    fix_daemon
+  fi
+  # overrides — always re-point to current pane (safe + idempotent)
+  fix_overrides
+  echo "${B}[fix]${X} done, running checks..."
+  echo
+fi
+
+# colors
+if [[ -t 1 ]]; then
+  G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; D=$'\e[2m'; B=$'\e[1m'; X=$'\e[0m'
+else G=; R=; Y=; D=; B=; X=; fi
+
+ok()   { echo "${G}[OK ]${X} $1"; }
+warn() { echo "${Y}[WRN]${X} $1"; WARNS+=("$1"); }
+fail() { echo "${R}[FL ]${X} $1"; FAILS+=("$1"); [[ -n "${2:-}" ]] && HINTS+=("$2"); }
+info() { echo "${D}      $1${X}"; }
+
+FAILS=()
+WARNS=()
+HINTS=()
+
+CDP_HOST="${CDP_HOST:-$(ip route show default 2>/dev/null | awk '{print $3}')}"
+CDP_HOST="${CDP_HOST:-127.0.0.1}"
+CDP_PORT="${CDP_PORT:-9334}"
+BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:7777}"
+TOKEN_FILE="${HOME}/.config/claude-web-bridge/token"
+
+echo "${B}bridge-doctor${X} ${D}—  CDP=${CDP_HOST}:${CDP_PORT}  server=${BRIDGE_URL}${X}"
+echo "---"
+
+# 1. tmux pane identity
+if [[ -n "${TMUX_PANE:-}" ]]; then
+  ok "tmux pane identity: TMUX_PANE=${TMUX_PANE}"
+else
+  warn "TMUX_PANE unset — calls from this shell will fail caller-permission checks"
+  HINTS+=("set TMUX_PANE explicitly: env TMUX_PANE=%N bridge-doctor")
+fi
+
+# 2. tmux-bridge + browser-bridge binaries
+if command -v tmux-bridge >/dev/null 2>&1; then
+  ok "tmux-bridge binary: $(command -v tmux-bridge)"
+else
+  fail "tmux-bridge binary not on PATH" "add ~/.smux/bin or ~/.local/bin to PATH"
+fi
+
+BB="$KIT_DIR/scripts/browser-bridge"
+if [[ -x "$BB" ]]; then
+  ok "browser-bridge binary: $BB"
+else
+  fail "browser-bridge binary missing at $BB" "check $KIT_DIR install"
+fi
+
+# 3. token
+if [[ -r "$TOKEN_FILE" ]]; then
+  TOKEN=$(cat "$TOKEN_FILE")
+  ok "token file present (${#TOKEN} chars)"
+else
+  fail "token file missing at $TOKEN_FILE" "run $KIT_DIR/install.sh"
+  TOKEN=""
+fi
+
+# 4. bridge server /health
+HEALTH=$(curl -sf -m 3 "${BRIDGE_URL}/health" 2>&1)
+if [[ -n "$HEALTH" ]] && echo "$HEALTH" | grep -q '"ok": *true'; then
+  TABS=$(echo "$HEALTH" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('tabs', '?'))" 2>/dev/null || echo "?")
+  AGE=$(echo "$HEALTH"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('tabs_updated_age_s', '?'))" 2>/dev/null || echo "?")
+  ok "bridge server reachable at ${BRIDGE_URL} (tabs=${TABS}, age=${AGE}s)"
+  if [[ "$AGE" != "?" ]] && (( $(echo "$AGE > 60" | bc -l 2>/dev/null || echo 0) )); then
+    warn "tabs_updated_age_s = ${AGE}s — daemon may be stuck (>60s since last update)"
+  fi
+else
+  fail "bridge server unreachable at ${BRIDGE_URL}" "start: cd $KIT_DIR && nohup python3 server/server.py >/tmp/bridge.log 2>&1 &"
+fi
+
+# 5. CDP daemon process
+DAEMON_PID=$(pgrep -f "cdp_daemon.py" | head -1)
+if [[ -n "$DAEMON_PID" ]]; then
+  ok "CDP daemon process alive (pid=${DAEMON_PID})"
+else
+  fail "CDP daemon not running" "start: CDP_HOST=${CDP_HOST} CDP_PORT=${CDP_PORT} setsid python3 $KIT_DIR/daemon/cdp_daemon.py run >/tmp/cdp_daemon.log 2>&1 < /dev/null & disown"
+fi
+
+# 6. CDP reachable from WSL
+CDP_VERSION=$(curl -sf -m 3 "http://${CDP_HOST}:${CDP_PORT}/json/version" 2>&1)
+if [[ -n "$CDP_VERSION" ]] && echo "$CDP_VERSION" | grep -q '"Browser"'; then
+  BROWSER=$(echo "$CDP_VERSION" | python3 -c "import json,sys; print(json.load(sys.stdin).get('Browser','?'))" 2>/dev/null)
+  ok "CDP reachable at ${CDP_HOST}:${CDP_PORT} (${BROWSER})"
+else
+  fail "CDP unreachable at ${CDP_HOST}:${CDP_PORT}" "is Chrome bridge running with --remote-debugging-port? is the Windows forwarder up? try bridge-ready, which brings the whole stack up from cold"
+fi
+
+# 7. side panels alive (real Chrome side panels via CDP)
+SIDE_PANELS_JSON=$(curl -sf -m 5 "http://${CDP_HOST}:${CDP_PORT}/json" 2>/dev/null)
+if [[ -n "$SIDE_PANELS_JSON" ]]; then
+  LIVE=$(echo "$SIDE_PANELS_JSON" | python3 -c "
+import json, sys, re
+d = json.load(sys.stdin)
+panels = [(x.get('id',''), re.search(r'tabId=(\d+)', x.get('url','')).group(1) if re.search(r'tabId=(\d+)', x.get('url','')) else '?') for x in d if 'sidepanel' in (x.get('url') or '').lower()]
+print(len(panels))
+for cdp_id, tab_id in panels:
+    print(f'  tab_id={tab_id}  cdp_id={cdp_id}')
+" 2>/dev/null)
+  N=$(echo "$LIVE" | head -1)
+  if [[ "$N" -gt 0 ]]; then
+    ok "live Chrome side panels: ${N}"
+    echo "$LIVE" | tail -n +2 | while read l; do info "$l"; done
+  else
+    fail "zero live side panels in Chrome" "click the orange Claude icon on a claude.ai tab to spawn a side panel"
+  fi
+fi
+
+# 8. discovered panels per server
+if [[ -n "$TOKEN" ]]; then
+  DISC=$(curl -sf -m 3 -H "Authorization: Bearer $TOKEN" "${BRIDGE_URL}/panels/discovered" 2>/dev/null)
+  if [[ -n "$DISC" ]]; then
+    N_DISC=$(echo "$DISC" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('discovered',[])))" 2>/dev/null)
+    ok "server /panels/discovered: ${N_DISC} entries"
+  else
+    fail "server /panels/discovered failed" "check bearer token + server logs"
+  fi
+
+  # 9. relay overrides
+  OVR=$(curl -sf -m 3 -H "Authorization: Bearer $TOKEN" "${BRIDGE_URL}/relay-target" 2>/dev/null)
+  if [[ -n "$OVR" ]]; then
+    if [[ -n "${TMUX_PANE:-}" ]]; then
+      MATCHED=$(echo "$OVR" | python3 -c "
+import json, sys, os
+d = json.load(sys.stdin)
+me = os.environ.get('TMUX_PANE', '')
+n = sum(1 for v in d.get('overrides', {}).values() if v == me)
+print(n)" 2>/dev/null)
+      if [[ "$MATCHED" -gt 0 ]]; then
+        ok "relay overrides: ${MATCHED} panel(s) routed to you (${TMUX_PANE})"
+      else
+        warn "no relay overrides point at your pane ${TMUX_PANE} — replies will leak elsewhere"
+        HINTS+=("re-point overrides: curl -X POST -H 'Authorization: Bearer \$TOKEN' -d '{\"tab_id\":<id>,\"target\":\"${TMUX_PANE}\"}' ${BRIDGE_URL}/relay-target")
+      fi
+    fi
+  fi
+fi
+
+# 10. optional live ping round-trip
+if [[ -n "$PING_TARGET" ]]; then
+  echo "---"
+  echo "ping ${PING_TARGET} (60s long-poll)..."
+  PING_RESULT=$("$BB" message "$PING_TARGET" "bridge-doctor ping at $(date +%H:%M:%S) — reply with one word: pong" 2>&1)
+  if echo "$PING_RESULT" | grep -qi "pong"; then
+    ok "ping round-trip succeeded — saw 'pong' in reply"
+  elif echo "$PING_RESULT" | grep -q "forbidden"; then
+    fail "ping forbidden — caller pane mismatch" "set TMUX_PANE=<your-pane> or re-point the relay override for that panel"
+    info "$PING_RESULT"
+  elif echo "$PING_RESULT" | grep -q "unknown panel"; then
+    fail "unknown panel '${PING_TARGET}'" "check 'browser-bridge list' for valid /brN aliases"
+  elif echo "$PING_RESULT" | grep -q "404"; then
+    warn "long-poll 404 — message was dispatched but no inline reply (expected on post-pull server)"
+    info "reply should land in your tmux pane via relay; if it doesn't, side panel may be stale"
+  elif echo "$PING_RESULT" | grep -qi "no Claude side panel"; then
+    fail "no side panel for this tab_id" "panel was closed — click the orange Claude icon on its tab to respawn"
+    info "$PING_RESULT"
+  else
+    warn "ping unclear outcome"
+    info "$PING_RESULT"
+  fi
+fi
+
+# summary
+echo "---"
+if (( ${#FAILS[@]} == 0 && ${#WARNS[@]} == 0 )); then
+  echo "${G}${B}all clear${X} — bridge is healthy"
+  exit 0
+else
+  if (( ${#FAILS[@]} > 0 )); then
+    echo "${R}${B}${#FAILS[@]} failure(s)${X}, ${#WARNS[@]} warning(s)"
+  else
+    echo "${Y}${B}${#WARNS[@]} warning(s)${X}, 0 failures"
+  fi
+  if (( ${#HINTS[@]} > 0 )); then
+    echo
+    echo "${B}fix hints:${X}"
+    for h in "${HINTS[@]}"; do echo "  • $h"; done
+  fi
+  (( ${#FAILS[@]} > 0 )) && exit 1 || exit 0
+fi

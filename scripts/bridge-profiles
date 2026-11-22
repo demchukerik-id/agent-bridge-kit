@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# bridge-profiles — open the bridge's Chrome profile group.
+#
+# The "group" is the two signed-in profiles inside the isolated debug
+# user-data-dir. One user-data-dir is one Chrome process with one CDP endpoint,
+# so both profile windows show up on the same debug port and the bridge sees
+# every tab from both without a second Chrome or a second port.
+#
+#   Set the directories with BRIDGE_PROFILE_GROUP or ~/.config/claude-web-bridge/profile-group.
+#
+# Usage: bridge-profiles [--list] [--only <profile dir>] [--url <url>] [--new]
+#   --list        print the group, and whether a launcher for each profile is
+#                 still in the process table (a weak signal, see below)
+#   --only <p>    open just that one profile
+#   --url <url>   open this url instead of the new-tab page
+#   --new         create a new profile (next free "Profile N") in the debug Chrome,
+#                 open it at the Claude for Chrome store page and add it to the group
+#
+# Each window is pinned with --profile-directory so Chrome cannot drift to
+# whatever profile.last_used happens to say. Profiles are verified against
+# Local State first: Chrome silently falls back to Default when the named
+# profile is missing, which would hand an agent the wrong account.
+set -uo pipefail
+
+CHROME_PORT=9333
+WSL_PORT=9334
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_winenv.sh"
+PROFILE_WIN="${WIN_LOCALAPPDATA}\\chrome-debug"
+PROFILE_DIR="$(wslpath -u "$PROFILE_WIN" 2>/dev/null)"
+CHROME_WIN='C:\Program Files\Google\Chrome\Application\chrome.exe'
+
+# The group. Keep the order stable: this is the order they open in.
+# Profile directory names differ per PC (Default/Profile 3 on one machine,
+# Profile 3/Profile 5 on another), so they are not hard-coded. Order of
+# precedence: BRIDGE_PROFILE_GROUP="Profile 3,Profile 5", then one name per line
+# in ~/.config/claude-web-bridge/profile-group, then every signed-in profile.
+GROUP_FILE="$HOME/.config/claude-web-bridge/profile-group"
+GROUP=()
+if [ -n "${BRIDGE_PROFILE_GROUP:-}" ]; then
+  IFS=',' read -r -a GROUP <<<"$BRIDGE_PROFILE_GROUP"
+elif [ -s "$GROUP_FILE" ]; then
+  mapfile -t GROUP < <(grep -v '^\s*$' "$GROUP_FILE")
+fi
+
+# Static window title per profile, set with --window-name. Chrome's normal
+# title follows the active tab; a named window shows ONLY this name in the
+# title bar and the Windows taskbar, so the two windows stay tellable apart.
+# Keyed by the signed-in account, not the directory, so the title is the same
+# on every PC. "window_names" in accounts.json overrides it per account.
+ACCOUNTS_FILE="$HOME/.config/claude-web-bridge/accounts.json"
+wname() {
+  local email named
+  email="$(label "$1" | awk -F' [|] ' '{print $2}')"
+  named="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("window_names",{}).get(sys.argv[2],""))' "$ACCOUNTS_FILE" "$email" 2>/dev/null)"
+  if [ -n "$named" ]; then echo "$named"; return; fi
+  case "$email" in
+    *@*)                    echo "${email%@*}@ - bridge pfl" ;;
+    *)                      echo "$1 - bridge pfl" ;;
+  esac
+}
+
+# A URL is not optional in practice. With no URL, a second invocation just hands
+# its args to the already-running Chrome and exits without creating a window, so
+# the profile never appears on CDP. Always give it something to open.
+ONLY="" URL="chrome://newtab/" LIST=0 NEW=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list) LIST=1; shift ;;
+    --new)  NEW=1; shift ;;
+    --only) ONLY="${2:-}"; shift 2 ;;
+    --url)  URL="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "bridge-profiles: unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+say() { echo "[bridge-profiles] $*"; }
+
+GW=$(ip route show default 2>/dev/null | awk '{print $3}')
+cdp_up() { curl -s -m 2 "http://${GW}:${WSL_PORT}/json/version" >/dev/null 2>&1; }
+
+# --- profile label from its Preferences file
+label() {
+  python3 - "$PROFILE_DIR/$1/Preferences" <<'PY' 2>/dev/null || echo "?"
+import json,sys
+try:
+    p=json.load(open(sys.argv[1],encoding='utf-8',errors='replace'))
+    name=p.get('profile',{}).get('name','?')
+    acc=p.get('account_info') or [{}]
+    print(f"{name} | {acc[0].get('email','not signed in')}")
+except Exception:
+    print("?")
+PY
+}
+
+# --- which profiles does Chrome actually know about
+known_profiles() {
+  python3 - "$PROFILE_DIR/Local State" <<'PY' 2>/dev/null
+import json,sys
+try:
+    d=json.load(open(sys.argv[1],encoding='utf-8',errors='replace'))
+    for k in (d.get('profile',{}).get('info_cache') or {}):
+        print(k)
+except Exception:
+    pass
+PY
+}
+
+# --- weak signal only. Chrome keeps ONE browser process per user-data-dir, and
+# a later invocation hands its args over and exits, so --profile-directory is
+# not reliably present in any surviving command line. Treat "no" as "unknown",
+# never as proof the window is closed. CDP page targets are the real check.
+window_open() {
+  local p="$1"
+  cd /mnt/c 2>/dev/null || true
+  powershell.exe -NoProfile -Command "\$m = Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | Where-Object { \$_.CommandLine -like '*chrome-debug*' -and \$_.CommandLine -like '*--profile-directory=$p*' }; if (\$m) { 'yes' } else { 'no' }" 2>/dev/null | tr -d '\r' | head -1
+}
+
+KNOWN="$(known_profiles)"
+
+# --new: Chrome creates a profile directory it is pointed at, so pick the next free
+# "Profile N", open it, and record it in the group file. Signing in is the user's step.
+if [ "$NEW" = 1 ]; then
+  cdp_up || { say "CDP not answering. Run bridge-ready first, so the debug Chrome is running."; exit 1; }
+  n=1; while echo "$KNOWN" | grep -qx "Profile $n" || [ -e "$PROFILE_DIR/Profile $n" ]; do n=$((n+1)); done
+  p="Profile $n"
+  [ "$URL" = "chrome://newtab/" ] && URL="https://chromewebstore.google.com/search/Claude"
+  say "creating '$p' in $PROFILE_WIN"
+  ( setsid cmd.exe /c start "" /B "$CHROME_WIN" --user-data-dir="$PROFILE_WIN" --profile-directory="$p" \
+      --remote-debugging-port=$CHROME_PORT --no-first-run --no-default-browser-check "$URL" >/dev/null 2>&1 & )
+  sleep 4
+  mkdir -p "$(dirname "$GROUP_FILE")"
+  [ -s "$GROUP_FILE" ] || known_profiles | while IFS= read -r k; do
+    case "$(label "$k")" in *"| not signed in"|"?") ;; *) echo "$k" ;; esac
+  done > "$GROUP_FILE"
+  grep -qx "$p" "$GROUP_FILE" 2>/dev/null || echo "$p" >> "$GROUP_FILE"
+  say "opened '$p' and added it to $GROUP_FILE"
+  say "next, in that new window (the user does these):"
+  say "  1. sign in to Chrome with the Google account this profile is for, and to claude.ai"
+  say "  2. install Claude for Chrome from the store page that opened"
+  say "  3. chrome://extensions > Developer mode > Load unpacked > the repo's ui/extension folder"
+  say "  4. open the bridge extension popup and paste the token (cat ~/.config/claude-web-bridge/token)"
+  say "then: bridge-profiles --list   (the new profile shows its account once signed in)"
+  exit 0
+fi
+# No explicit group: every profile in this user-data-dir that is signed in.
+# An unsigned profile (a leftover "Person 1") is never an agent's account.
+if [ ${#GROUP[@]} -eq 0 ]; then
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$(label "$p")" in *"| not signed in"|"?") ;; *) GROUP+=("$p") ;; esac
+  done <<<"$KNOWN"
+fi
+
+if [ "$LIST" = 1 ]; then
+  say "group in $PROFILE_WIN"
+  for p in "${GROUP[@]}"; do
+    mark="  "
+    echo "$KNOWN" | grep -qx "$p" || mark="!!"
+    printf "  %s %-10s %-40s open=%s\n" "$mark" "$p" "$(label "$p")" "$(window_open "$p")"
+  done
+  cdp_up && say "CDP answering on ${GW}:${WSL_PORT}" || say "CDP not answering; run bridge-ready first"
+  exit 0
+fi
+
+TARGETS=("${GROUP[@]}")
+[ -n "$ONLY" ] && TARGETS=("$ONLY")
+
+for p in "${TARGETS[@]}"; do
+  if ! echo "$KNOWN" | grep -qx "$p"; then
+    say "SKIP '$p': not in Local State. Chrome would silently fall back to Default."
+    continue
+  fi
+  say "opening '$p' ($(label "$p"))"
+  # --remote-debugging-port is only honoured by the process that starts the
+  # user-data-dir. A second invocation just asks the running Chrome for a new
+  # window, which is what we want, and it inherits the same CDP endpoint.
+  ( setsid cmd.exe /c start "" /B "$CHROME_WIN" \
+      --user-data-dir="$PROFILE_WIN" \
+      --profile-directory="$p" \
+      --remote-debugging-port=$CHROME_PORT \
+      --disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows \
+      --window-name="$(wname "$p")" \
+      --no-first-run --no-default-browser-check "$URL" >/dev/null 2>&1 & )
+  sleep 3
+done
+
+sleep 1
+if cdp_up; then
+  n=$(curl -s -m 3 "http://${GW}:${WSL_PORT}/json" | grep -c '"type": "page"' || echo 0)
+  say "CDP up on ${GW}:${WSL_PORT}, $n page targets visible to the bridge"
+else
+  say "CDP not answering on ${GW}:${WSL_PORT}. Run bridge-ready, then re-run this."
+fi

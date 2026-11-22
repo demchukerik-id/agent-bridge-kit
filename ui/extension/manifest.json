@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "browser-claude-bridge",
+  "version": "0.1.0",
+  "description": "Bridge tmux agents to claude.ai chat. Pairs with the bridge server at 127.0.0.1:7777.",
+  "permissions": ["storage", "scripting", "tabs", "debugger", "bookmarks", "tabGroups"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:7777/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "browser-claude-bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon-16.png",
+      "32": "icon-32.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "32": "icon-32.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  }
+}

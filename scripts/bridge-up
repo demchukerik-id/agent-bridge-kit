@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# bridge-up — ONE idempotent, restart-proof command to bring the whole
+# browser-claude-bridge online and prove it healthy. Safe to run repeatedly.
+# Installed at: ~/.local/bin/bridge-up  (chmod +x, syntax-checked)
+#
+# Guarantees, in dependency order:
+#   1. CDP_HOST = live WSL->Windows gateway (never hard-coded, never the
+#      resolv.conf nameserver 10.255.255.254).
+#   2. CDP_PORT = 9334 (canonical WSL-facing port; Chrome lives on
+#      127.0.0.1:9333 behind the Windows forwarder).
+#   3. Windows CDP forwarder 0.0.0.0:9334 -> 127.0.0.1:9333 is up.
+#   4. Bridge Chrome (isolated chrome-debug profile) listening on :9333,
+#      reachable from WSL through the forwarder.
+#   5. Bridge server (server/server.py, :7777) up — DETACHED to survive a
+#      Claude Code restart.
+#   6. CDP daemon (daemon/cdp_daemon.py run) up — DETACHED, correct env.
+#   7. Checks every part with bridge-doctor.
+#
+# Detachment recipe: setsid + nohup + `& disown` + stdio redirect. Severs the
+# controlling tty, the SIGHUP path, and the shell job table — the three links
+# Claude Code tears down on restart. (wsl --shutdown / reboot still kill them.)
+set -uo pipefail
+KIT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+# ---- config ----------------------------------------------------------------
+BRIDGE_DIR="${BRIDGE_DIR:-$KIT_DIR}"
+BRIDGE_URL="${BRIDGE_URL:-http://127.0.0.1:7777}"
+TOKEN_FILE="$HOME/.config/claude-web-bridge/token"
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_winenv.sh"
+FORWARDER_WIN="${WIN_LOCALAPPDATA}\\chrome-debug-forwarder.py"
+CHROME_WIN='C:\Program Files\Google\Chrome\Application\chrome.exe'
+CHROME_PROFILE_WIN="${WIN_LOCALAPPDATA}\\chrome-debug"
+CHROME_PORT=9333        # Chrome's own loopback debug port (Windows side)
+
+# Canonical WSL-facing port: forwarder fronts 9334 -> Chrome 9333.
+# 9222 is the upstream default but is stolen by svchost (PID 5052) on this box,
+# so we standardize the whole WSL side on 9334.
+export CDP_PORT="${CDP_PORT:-9334}"
+
+# Live gateway (Windows host as seen from WSL). Never hard-code; never the
+# resolv.conf nameserver (10.255.255.254 is WRONG here).
+export CDP_HOST="${CDP_HOST:-$(ip route show default 2>/dev/null | awk '{print $3}')}"
+if [[ -z "$CDP_HOST" || "$CDP_HOST" == "10.255.255.254" ]]; then
+  echo "[bridge-up] FATAL: could not resolve a sane CDP_HOST (got '${CDP_HOST:-<empty>}')." >&2
+  echo "[bridge-up] Fix WSL networking, then re-run. Do NOT fall back to the nameserver." >&2
+  exit 1
+fi
+
+if [[ -t 1 ]]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; X=$'\e[0m'; else B=; G=; Y=; X=; fi
+log() { echo "${B}[bridge-up]${X} $*"; }
+
+cdp_ok()    { curl -sf -m 2 "http://${CDP_HOST}:${CDP_PORT}/json/version" 2>/dev/null | grep -q '"Browser"'; }
+server_ok() { curl -sf -m 2 "${BRIDGE_URL}/health" 2>/dev/null | grep -q '"ok": *true'; }
+daemon_ok() { pgrep -f "cdp_daemon.py" >/dev/null 2>&1; }
+
+# ---- 3. Windows CDP forwarder (0.0.0.0:9334 -> 127.0.0.1:9333) --------------
+ensure_forwarder() {
+  if cdp_ok; then log "${G}forwarder+Chrome OK${X} (CDP reachable at ${CDP_HOST}:${CDP_PORT})"; return; fi
+  log "starting Windows CDP forwarder (0.0.0.0:9334 -> 127.0.0.1:${CHROME_PORT})..."
+  cmd.exe /c start "" /B python "$FORWARDER_WIN" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  sleep 3
+}
+
+# ---- 4. Bridge Chrome (isolated debug profile) on :9333 --------------------
+ensure_chrome() {
+  if cdp_ok; then return; fi
+  log "${Y}CDP still unreachable — launching bridge Chrome on :${CHROME_PORT} (isolated profile)${X}"
+  # Isolated --user-data-dir is parallel-safe with daily Chrome (Mode B). If a
+  # chrome-debug instance were already up, cdp_ok would already have passed, so
+  # this never hijacks an existing debug session.
+  cmd.exe /c start "" /B "$CHROME_WIN" \
+    --user-data-dir="$CHROME_PROFILE_WIN" \
+    --remote-debugging-port=${CHROME_PORT} \
+    --disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows \
+    --remote-debugging-address=0.0.0.0 \
+    --no-first-run \
+    --no-default-browser-check >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  # Chrome ignores 0.0.0.0 and binds loopback only, so re-assert the forwarder.
+  sleep 4
+  cmd.exe /c start "" /B python "$FORWARDER_WIN" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  for _ in $(seq 1 10); do cdp_ok && break; sleep 2; done
+  if cdp_ok; then log "${G}bridge Chrome reachable${X} at ${CDP_HOST}:${CDP_PORT}";
+  else log "${Y}WARNING: CDP still unreachable. A non-debug Chrome may hold the chrome-debug profile, or :${CHROME_PORT} is taken. See issue doc.${X}"; fi
+}
+
+# ---- 5. Bridge server (DETACHED) ------------------------------------------
+ensure_server() {
+  if server_ok; then log "${G}server OK${X} (${BRIDGE_URL}/health)"; return; fi
+  log "starting bridge server (detached)..."
+  ( cd "$BRIDGE_DIR" && \
+    setsid env CDP_HOST="$CDP_HOST" CDP_PORT="$CDP_PORT" \
+      nohup systemd-run --user --scope --quiet --collect sh -c 'exec "$@"' sh python3 server/server.py >/tmp/bridge.log 2>&1 </dev/null & disown )
+  for _ in $(seq 1 10); do server_ok && break; sleep 1; done
+  server_ok && log "${G}server up${X}" || log "${Y}server failed — see /tmp/bridge.log${X}"
+}
+
+# ---- 6. CDP daemon (DETACHED, correct env) ---------------------------------
+ensure_daemon() {
+  if daemon_ok; then log "${G}daemon OK${X} (pid $(pgrep -f cdp_daemon.py | head -1))"; return; fi
+  log "starting CDP daemon (detached, CDP_HOST=${CDP_HOST} CDP_PORT=${CDP_PORT})..."
+  setsid env CDP_HOST="$CDP_HOST" CDP_PORT="$CDP_PORT" \
+    systemd-run --user --scope --quiet --collect sh -c 'exec "$@"' sh python3 "$BRIDGE_DIR/daemon/cdp_daemon.py" run >/tmp/cdp_daemon.log 2>&1 </dev/null & disown
+  for _ in $(seq 1 10); do daemon_ok && break; sleep 1; done
+  daemon_ok && log "${G}daemon up${X}" || log "${Y}daemon failed — see /tmp/cdp_daemon.log${X}"
+}
+
+# ---- 7. Context-usage reporter (DETACHED) ----------------------------------
+# Reads each Claude side panel's real context size over CDP and feeds
+# /panels/ctx, which the popup and dashboard render as a percentage. Must run
+# outside Chrome: an extension cannot debug another extension's page.
+ctx_ok() { pgrep -f "ctx_usage.py" >/dev/null 2>&1; }
+ensure_ctx_usage() {
+  if ctx_ok; then log "${G}ctx-usage OK${X} (pid $(pgrep -f ctx_usage.py | head -1))"; return; fi
+  log "starting ctx-usage reporter (detached)..."
+  setsid env CDP_HOST="$CDP_HOST" CDP_PORT="$CDP_PORT" \
+    python3 "$BRIDGE_DIR/daemon/ctx_usage.py" >/tmp/ctx_usage.log 2>&1 </dev/null & disown
+  for _ in $(seq 1 5); do ctx_ok && break; sleep 1; done
+  ctx_ok && log "${G}ctx-usage up${X}" || log "${Y}ctx-usage failed — see /tmp/ctx_usage.log${X}"
+}
+
+# ---- run -------------------------------------------------------------------
+log "CDP target = ${CDP_HOST}:${CDP_PORT}  (Chrome :${CHROME_PORT} behind forwarder)  server = ${BRIDGE_URL}"
+[[ -r "$TOKEN_FILE" ]] || log "${Y}note: token file missing ($TOKEN_FILE) — run install.sh if server 401s${X}"
+ensure_forwarder
+ensure_chrome
+ensure_server
+ensure_daemon
+ensure_ctx_usage
+
+echo
+log "verifying..."
+export CDP_HOST CDP_PORT   # so bridge-doctor checks 9334
+bridge-doctor

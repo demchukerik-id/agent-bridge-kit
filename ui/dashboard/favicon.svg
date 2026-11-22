@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- bridge//ops mark: dark tile, corner ticks, phosphor double-slash -->
+  <rect width="32" height="32" fill="#0b1211"/>
+  <path d="M3 9V3h6M29 9V3h-6M3 23v6h6M29 23v6h-6"
+        fill="none" stroke="#2b8f68" stroke-width="2"/>
+  <path d="M14 8L9 24M23 8l-5 16"
+        fill="none" stroke="#74b394" stroke-width="3.2" stroke-linecap="square"/>
+</svg>

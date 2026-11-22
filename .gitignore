@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local user config (lives outside the repo, but guard against accidents)
+.config/
+*.local.json
+
+
+# Logs
+*.log
+nohup.out
+
+# Node / extension build artifacts
+node_modules/
+*.crx
+*.zip
+
+# Editor backups
+*.bak
+*.bak[0-9]
+
+# Local .bak copies of any file
+*.bak-*
+
+# Local secrets
+.env
+*.env
+
+# Python caches and local state
+__pycache__/
+AUDIT.json
+handoffs/

@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# agent-resume — reopen a PAST agent conversation in its own VS Code tab.
+#
+#   agent-resume claude "work"      resume the newest claude session whose title
+#                                  matches "work" (no picker)
+#   agent-resume claude --last     newest session in this directory
+#   agent-resume claude            open the picker
+#   agent-resume codex "name"      codex resume <name>   (id or session name)
+#   agent-resume codex --last      codex resume --last
+#   agent-resume codex             codex picker
+#   agent-resume claude --list     print matching titles and ids, open nothing
+#
+# Flags: --dir <dir> (default: cwd), --no-tab (tmux session only).
+# Placement, naming and peer wiring match agent-spawn: session <agent>-pane-<id>,
+# an editor tab, and ~/.claude/agent-peers/<pane>.json.
+set -euo pipefail
+
+AGENT="${1:-}"
+case "$AGENT" in
+  claude|codex) shift ;;
+  *) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 2 ;;
+esac
+
+DIR="$PWD"
+QUERY=""
+MODE=vscode
+LIST=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir) DIR="$2"; shift 2 ;;
+    --no-tab) MODE=detached; shift ;;
+    --list) LIST=1; shift ;;
+    --last) QUERY="--last"; shift ;;
+    *) QUERY="$1"; shift ;;
+  esac
+done
+DIR="$(cd "$DIR" && pwd)"
+
+# Resolve a claude session id from a title substring.
+claude_find() {
+  python3 - "$DIR" "$1" "$2" <<'PY'
+import json, os, re, sys
+cwd, query, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+key = re.sub(r'[^A-Za-z0-9]', '-', cwd)
+d = os.path.join(os.path.expanduser('~/.claude/projects'), key)
+if not os.path.isdir(d):
+    sys.exit(3)
+
+def title(path):
+    best = None
+    try:
+        with open(path, errors='ignore') as f:
+            for i, line in enumerate(f):
+                if i > 400:
+                    break
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get('type') == 'custom-title':
+                    return r['customTitle']
+                if r.get('type') == 'summary' and not best:
+                    best = r.get('summary')
+                if best is None and r.get('type') == 'user':
+                    c = r.get('message', {}).get('content')
+                    if isinstance(c, str) and c.strip():
+                        best = c.strip().splitlines()[0][:60]
+    except OSError:
+        pass
+    return best or '(untitled)'
+
+files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith('.jsonl')]
+files.sort(key=os.path.getmtime, reverse=True)
+rows = [(os.path.basename(p)[:-6], title(p)) for p in files]
+if mode == 'list':
+    for sid, t in rows:
+        print(f"{sid}  {t}")
+    sys.exit(0)
+q = query.lower()
+for sid, t in rows:
+    if q == sid or q in t.lower():  # an exact session id resumes that chat
+        print(sid)
+        sys.exit(0)
+sys.exit(4)
+PY
+}
+
+if [[ "$AGENT" == "claude" && "$LIST" == 1 ]]; then
+  claude_find "" list
+  exit 0
+fi
+
+if [[ "$AGENT" == "claude" ]]; then
+  case "$QUERY" in
+    "")       CMD="claude --resume" ;;
+    --last)   CMD="claude --continue" ;;
+    *)
+      SID="$(claude_find "$QUERY" find)" || {
+        echo "agent-resume: no claude session in $DIR matching '$QUERY'" >&2
+        echo "               list them with: agent-resume claude --list" >&2
+        exit 1
+      }
+      CMD="claude --resume $SID"
+      ;;
+  esac
+else
+  case "$QUERY" in
+    "")       CMD="codex resume" ;;
+    --last)   CMD="codex resume --last" ;;
+    *)        CMD="codex resume '$QUERY'" ;;
+  esac
+fi
+
+TMP="resume-$$"
+tmux new-session -d -s "$TMP" -c "$DIR"
+PANE="$(tmux display-message -p -t "${TMP}:0.0" '#{pane_id}')"
+SESSION="${AGENT}-pane-${PANE#%}"
+tmux rename-session -t "$TMP" "$SESSION"
+tmux rename-window -t "${SESSION}:0" "$SESSION" 2>/dev/null || true
+tmux send-keys -t "${SESSION}:0.0" "$CMD" Enter
+
+command -v tmux-bridge >/dev/null 2>&1 && tmux-bridge name "$PANE" "$SESSION" >/dev/null 2>&1 || true
+
+PARENT_PANE="${TMUX_PANE:-}"
+PARENT_LABEL=""
+[[ -n "$PARENT_PANE" ]] && PARENT_LABEL="$(tmux display-message -p -t "$PARENT_PANE" '#{session_name}:#{window_name}' 2>/dev/null || true)"
+PEER_DIR="${HOME}/.claude/agent-peers"
+mkdir -p "$PEER_DIR"
+# server: the tmux server pid (agent-peer-intro.sh ignores a file from an older server).
+printf '{"self_pane":"%s","self_label":"%s","parent_pane":"%s","parent_label":"%s","server":"%s"}\n' \
+  "$PANE" "$SESSION" "$PARENT_PANE" "$PARENT_LABEL" "$(tmux display-message -p '#{pid}')" > "${PEER_DIR}/${PANE}.json"
+
+echo "[ok] tmux session: $SESSION  ($CMD in $DIR)"
+echo "     peer: $SESSION = $PANE${PARENT_PANE:+  (you are $PARENT_PANE)}"
+
+if [[ "$MODE" == "detached" ]]; then
+  echo "     attach with: tmux attach -t $SESSION"
+  exit 0
+fi
+
+# The editor's name, and the queue (cmd.exe is skipped when AGENT_TABS_DIR is set).
+BRIDGE_EDITOR_ONLY="$([[ -n "${AGENT_TABS_DIR:-}" ]] && echo 1 || true)" \
+  . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_winenv.sh"
+QUEUE_DIR="$AGENT_TABS_DIR"
+mkdir -p "$QUEUE_DIR"
+printf '{"session":"%s","distro":"%s","dir":"%s"}\n' "$SESSION" "${WSL_DISTRO_NAME:-}" "$DIR" \
+  > "${QUEUE_DIR}/${SESSION}.json"
+echo "     requested a $EDITOR_NAME terminal tab for $SESSION"

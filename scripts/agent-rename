@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# agent-rename — rename an agent pane on all three labels the user sees, then check each.
+#
+# Usage: agent-rename <pane-id> <new-name>
+#   <pane-id>   tmux pane id, e.g. %51
+#   <new-name>  e.g. 51cld-topaz-safety-watch (no leading %, keep it under ~30 chars)
+#
+# Labels, in order:
+#   1. agent session name   /rename inside Claude or Codex (prompt divider / status line)
+#   2. tmux pane title      select-pane -T plus @name
+#   3. editor tab           tmux session rename, then an agent-tabs extension rename request
+#                           from the tab's current label when the tab did not follow
+#
+# The tab is checked by asking the extension for the live tab names (state/tabs.json)
+# and the rename request is retried up to 3 times. Prints PASS/FAIL/QUEUED per label.
+# Exit 0 only when no label FAILs. Do not report a rename as done on a non-zero exit.
+set -uo pipefail
+
+PANE="${1:-}" NEW="${2:-}"
+case "$PANE" in -h|--help|"") sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+[ -n "$NEW" ] || { echo "agent-rename: need a new name" >&2; exit 1; }
+case "$NEW" in %*) echo "agent-rename: no leading % in the name (tmux reads it as a pane id)" >&2; exit 1 ;; esac
+tmux display -p -t "$PANE" "#{pane_id}" >/dev/null 2>&1 || { echo "agent-rename: no pane $PANE" >&2; exit 1; }
+
+# The editor's name, and the queue (cmd.exe is skipped when AGENT_TABS_DIR is set).
+BRIDGE_EDITOR_ONLY="$([ -n "${AGENT_TABS_DIR:-}" ] && echo 1)" \
+  . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_winenv.sh"
+QUEUE="$AGENT_TABS_DIR"
+TABS=$QUEUE/state/tabs.json
+nap() { python3 -c "import time; time.sleep($1)"; }
+
+# Current tab names across all editor windows, one label per line. Each window keeps
+# state/tabs-<pid>.json up to date. Older extension builds only have the shared
+# tabs.json, which the last window to change overwrites, so fall back to a list request.
+tab_labels() {
+  if ls "$QUEUE"/state/tabs-*.json >/dev/null 2>&1; then
+    nap 1   # give the extension a moment to write the change
+    python3 -c "
+import json,sys
+for f in sys.argv[1:]:
+    try: [print(t['label']) for t in json.load(open(f))['tabs']]
+    except Exception: pass" "$QUEUE"/state/tabs-*.json | sort -u
+    return
+  fi
+  local before; before=$(cat "$TABS" 2>/dev/null)
+  echo '{"action":"list"}' > "$QUEUE/list-$(date +%s%N).json"
+  for _ in $(seq 1 30); do
+    nap 0.3
+    [ "$(cat "$TABS" 2>/dev/null)" != "$before" ] && break
+  done
+  python3 -c "import json,sys; [print(t['label']) for t in json.load(open(sys.argv[1]))['tabs']]" "$TABS" 2>/dev/null
+}
+
+OLD_SESS=$(tmux display -p -t "$PANE" "#{session_name}")
+proc=$(ps -o args= --ppid "$(tmux display -p -t "$PANE" "#{pane_pid}")" 2>/dev/null | head -1)
+case "$proc" in claude*) KIND=claude ;; *codex*) KIND=codex ;; *) KIND=none ;; esac
+SELF=0; [ "$PANE" = "${TMUX_PANE:-}" ] && SELF=1
+
+# 1. agent session name
+R1=FAIL
+if [ "$KIND" = none ]; then
+  R1="SKIP (no agent running in $PANE)"
+elif tmux capture-pane -p -t "$PANE" | tail -6 | grep -qiE '\b(y/n|yes/no)\b'; then
+  R1="FAIL (pane is on a confirmation prompt; a keystroke would answer it)"
+else
+  if [ "$KIND" = codex ]; then
+    tmux send-keys -t "$PANE" "/rename $NEW"; nap 0.5; tmux send-keys -t "$PANE" Enter
+  else
+    tmux send-keys -t "$PANE" "/rename $NEW" Enter
+  fi
+  if [ $SELF = 1 ]; then
+    R1="QUEUED (this is the calling pane; /rename runs when the current turn ends)"
+  else
+    for _ in $(seq 1 20); do
+      nap 0.5
+      # the divider/status line, not the typed "/rename <name>" still sitting in the input
+      tmux capture-pane -p -t "$PANE" | grep -F -- "$NEW" | grep -qvF "/rename" && { R1=PASS; break; }
+    done
+    [ "$R1" = PASS ] || R1="FAIL (name not on screen after 10 s; the agent may be busy, check the divider)"
+  fi
+fi
+
+# 2. tmux pane title
+tmux select-pane -t "$PANE" -T "$NEW"
+tmux set -p -t "$PANE" @name "$NEW"
+[ "$(tmux display -p -t "$PANE" '#{@name}')" = "$NEW" ] && R2=PASS || R2=FAIL
+
+# 3. editor tab
+if [ "$OLD_SESS" != "$NEW" ]; then
+  tmux rename-session -t "=$OLD_SESS" "$NEW" 2>/dev/null \
+    && tmux rename-session -t "=$NEW" "${NEW}-tmp" && tmux rename-session -t "=${NEW}-tmp" "$NEW"
+fi
+# tmux refuses a name another session holds; the tab would then flip back to the old name (2026-11-06).
+SESS=$(tmux display -p -t "$PANE" '#{session_name}')
+# The tmux title push often does not reach the tab (it kept saying "wsl" on 2026-10-04),
+# so rename through the extension from the label the tab shows now: the old session
+# name, or else the one label that matches no tmux session. Never guess between several.
+R3=FAIL FROM=""
+[ "$SESS" != "$NEW" ] && R3="FAIL (tmux kept \"$SESS\": another session is already named \"$NEW\"; rename or close it first)"
+for try in 1 2 3; do
+  [ "$SESS" != "$NEW" ] && break
+  labels=$(tab_labels)
+  if grep -qxF -- "$NEW" <<<"$labels"; then R3="PASS (try $try${FROM:+, renamed from \"$FROM\"})"; break; fi
+  if grep -qxF -- "$OLD_SESS" <<<"$labels"; then
+    FROM=$OLD_SESS
+  elif [ "$(tmux display -p -t "$PANE" '#{session_attached}')" -gt 0 ]; then
+    orphans=$(grep -vxF -f <(tmux list-sessions -F '#{session_name}') <<<"$labels" | grep -v '^$')
+    [ "$(grep -c . <<<"$orphans")" = 1 ] && FROM=$orphans
+  fi
+  [ -n "$FROM" ] && echo "{\"action\":\"rename\",\"from\":\"$FROM\",\"to\":\"$NEW\"}" > "$QUEUE/rename-$(date +%s%N).json"
+  nap 2
+done
+if [[ "$R3" != PASS* ]] && [ "$SESS" = "$NEW" ]; then
+  labels=$(tab_labels)
+  if grep -qxF -- "$NEW" <<<"$labels"; then R3="PASS (late)"
+  elif [ -z "$labels" ]; then R3="FAIL (extension did not answer; is $EDITOR_NAME open?)"
+  else R3="FAIL (tabs seen: $(paste -sd, <<<"$labels"); no single tab to rename from, or it is in another $EDITOR_NAME window; ask the user which tab it is)"
+  fi
+fi
+
+echo "1 agent session name: $R1"
+echo "2 tmux pane title:    $R2"
+echo "3 editor tab:         $R3"
+[[ "$R1" == FAIL* || "$R2" == FAIL* || "$R3" == FAIL* ]] && exit 1 || exit 0

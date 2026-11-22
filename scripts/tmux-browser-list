@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# tmux-browser-list — naming-parallel shortcut for `browser-bridge list`.
+#
+# Mirrors `tmux-bridge list` for the browser-bridge side. Lists every
+# registered + discovered Claude for Chrome side panel with its %N alias,
+# kind, tab_id, and (if any) tab title. Equivalent to `tmux-browser-bridge
+# list` or `browser-bridge list`.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec python3 "$here/browser-bridge" list "$@"

@@ -1,0 +1,34 @@
+{
+  "name": "agent-tabs",
+  "displayName": "Agent Tabs",
+  "description": "Opens a VS Code terminal tab attached to a tmux session when agent-spawn or agent-resume drops a request file, and renames, focuses or moves those tabs on request.",
+  "icon": "icon.png",
+  "publisher": "local",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "extensionKind": ["ui"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentTabs.processQueue",
+        "title": "Agent Tabs: Process Queue Now"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Tabs",
+      "properties": {
+        "agentTabs.queueDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory watched for requests. Empty means <home>/.claude/agent-tabs."
+        }
+      }
+    }
+  }
+}

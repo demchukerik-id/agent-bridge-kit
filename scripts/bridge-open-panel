@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""bridge-open-panel — open a new tab and the Claude side panel in it, by shortcut.
+
+    bridge-open-panel [--account <email>] [--url <url>] [--name <task>] [--check-shortcut]
+
+Does what the user does by hand in the bridge Chrome window of that account:
+Ctrl+T, then Alt+W (the Claude for Chrome "Activate the extension" shortcut).
+Prints the new panel's tab id, the same id `browser-bridge list` shows.
+
+  --account         which profile window to use, by signed-in account
+  --url             load this url in the new tab before opening the panel
+  --name            name the panel after its task (lowercase-with-dashes, max
+                    30 chars, -2 added if taken). The tab group gets the name
+                    and a color once it exists, and the chat and group are
+                    deleted 5 h after opening (server panel sweep).
+  --check-shortcut  verify Alt+W in chrome://extensions/shortcuts even if a
+                    previous run already did
+
+Shortcut setup. Chrome ships Claude with no Windows shortcut, so on a fresh PC
+or profile Alt+W does nothing. The first run per account opens
+chrome://extensions/shortcuts in the new tab, reads the binding through
+chrome.developerPrivate (the API that page itself uses), sets Alt+W if it is
+missing, and records the account in ~/.config/claude-web-bridge/shortcut-ok.
+Later runs skip that check. If Alt+W ever fails to open a panel, the record is
+dropped and the check runs once more.
+
+Keys are pressed by windows/window-keys.ps1, which refuses to press anything
+unless the named bridge window is the foreground window.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _panel_cdp import (EXT_ID, default_account, resolve_account, PORT, CDPClient, cdp_host, close_target,  # noqa: E402
+                        connect, panel_ids, targets, wait_for, window_keys, window_name)
+from _panel_cdp import die as _die  # noqa: E402
+from _panel_cdp import evaluate as _evaluate  # noqa: E402
+
+SHORTCUT = "Alt+W"
+OK_FILE = Path.home() / ".config/claude-web-bridge/shortcut-ok"
+TOKEN_FILE = Path.home() / ".config/claude-web-bridge/token"
+BRIDGE_URL = os.environ.get("CLAUDE_BRIDGE_URL", "http://127.0.0.1:7777")
+OPEN_LOCK = Path.home() / ".config/claude-web-bridge/open-panel.lock"
+
+
+def die(msg: str) -> None:
+    _die("bridge-open-panel", msg)
+
+
+ACCOUNT = ""  # set in main() from --account
+CLAIM_OPEN = [False]  # this run holds an unconsumed panel claim
+
+
+def reopen_window(win: str) -> bool:
+    """Open the account's named bridge window in the running bridge Chrome.
+
+    The window title is fixed only on the window Chrome was launched with
+    (--window-name). Once that window is closed, the profile's other windows
+    carry ordinary page titles and window_keys cannot find the bridge window
+    (2026-10-10, ticket open-panel-no-bridge-window). bridge-profiles --only
+    asks the running Chrome for a new window with the name."""
+    out = subprocess.run([str(Path(__file__).resolve().parent / "bridge-profiles"), "--list"],
+                         capture_output=True, text=True).stdout
+    prof = next((m.group(1) for m in re.finditer(r"^\s*(?:!!)?\s*(Default|Profile \d+)\s.*\|\s*(\S+@\S+)", out, re.M)
+                 if m.group(2) == ACCOUNT), None)
+    if not prof:
+        return False
+    print(f"[open-panel] no window titled '{win}', opening it ({prof})", file=sys.stderr)
+    subprocess.run([str(Path(__file__).resolve().parent / "bridge-profiles"), "--only", prof],
+                   capture_output=True, text=True)
+    return True
+
+
+def press(win: str, keys: list[str]) -> None:
+    # Chrome is in front only while the keys go in, then the user's window gets focus back.
+    err = window_keys(win, keys, restore=True)
+    if err.startswith("ABORT: no window titled") and reopen_window(win):
+        for _ in range(10):
+            time.sleep(1)
+            err = window_keys(win, keys, restore=True)
+            if not err.startswith("ABORT: no window titled"):
+                break
+    if err:
+        # A claim registered for this run would otherwise wait 5 min and bind
+        # the next panel anyone opens to this pane (2026-10-10: three aborted
+        # runs from %16 took the next panel opened by %3).
+        if CLAIM_OPEN[0]:
+            claim("cancel-claim")
+            CLAIM_OPEN[0] = False
+        die(err)
+
+
+def sender() -> str:
+    """Same identity rule as get_sender() in browser-bridge."""
+    return os.environ.get("BB_SENDER") or os.environ.get("TMUX_PANE") or \
+        f"virtual:{socket.gethostname()}:{os.getpid()}"
+
+
+def claim(action: str) -> None:
+    """Bind the next new panel to the calling pane ("open-tab", claim only),
+    or drop that claim ("cancel-claim"). A claimed panel is not announced or
+    greeted from whichever pane the user spoke to last, and the caller may send
+    to it without --force. Best effort: a missing server leaves the panel
+    unclaimed but still open."""
+    try:
+        tok = TOKEN_FILE.read_text().strip()
+        body = json.dumps({"from_pane": sender(), "claim_only": True}).encode()
+        req = urllib.request.Request(f"{BRIDGE_URL}/browser/{action}", data=body, method="POST",
+                                     headers={"Authorization": f"Bearer {tok}",
+                                              "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=3)
+    except OSError as e:
+        print(f"[warn] could not {action} for {sender()}: {e}", file=sys.stderr)
+
+
+
+def in_worker(host: str, js: str):
+    """Run js in Claude for Chrome's service worker (one per profile; the first
+    non-null result wins). Same as bridge-close-panel's helper."""
+    for w in [t for t in targets(host) if t["type"] == "service_worker"
+              and t["url"].startswith(f"chrome-extension://{EXT_ID}/")]:
+        c = connect(host, w)
+        try:
+            res = _evaluate(c, js)
+        finally:
+            c.close()
+        if res:
+            return res
+    return None
+
+
+def name_panel(tab_id: str, name: str) -> str:
+    """Register the panel under its task name and start its 5 h clock.
+    Returns the name the server gave it (may carry -2)."""
+    tok = TOKEN_FILE.read_text().strip()
+    body = json.dumps({"tab_id": int(tab_id), "name": name, "owner_pane": sender()}).encode()
+    req = urllib.request.Request(f"{BRIDGE_URL}/panels/meta/open", data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {tok}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r)["name"]
+    except urllib.error.HTTPError as e:
+        die(f"panel {tab_id} opened, but naming it failed: {e.read().decode(errors='replace')}")
+    except OSError as e:
+        die(f"panel {tab_id} opened, but naming it failed: {e}")
+    return name  # unreachable
+
+
+def wait_registered(tab_id: str) -> None:
+    """Return only once the server knows the panel. Its registry fills from the
+    extension's push every few seconds, and a message sent to a tab it does not
+    know yet was dropped without an error (seen 2026-10-04)."""
+    tok = TOKEN_FILE.read_text().strip()
+    req = urllib.request.Request(f"{BRIDGE_URL}/panels/all", headers={"Authorization": f"Bearer {tok}"})
+    end = time.time() + 15
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(req, timeout=3) as r:
+                if any(str(p.get("tab_id")) == str(tab_id) for p in json.load(r).get("panels", [])):
+                    return
+        except OSError:
+            pass
+        time.sleep(0.3)
+    print(f"[warn] the bridge server has not registered tab {tab_id} yet; wait a few seconds before messaging it",
+          file=sys.stderr)
+
+# chrome://extensions/shortcuts drives its own UI through chrome.developerPrivate,
+# so the page is asked the same way rather than clicked.
+GET = f"""new Promise(r => chrome.developerPrivate.getExtensionInfo('{EXT_ID}', i =>
+  r((i.commands.find(c => c.name === '_execute_action') || {{}}).keybinding || '')))"""
+SET = f"""new Promise(r => chrome.developerPrivate.updateExtensionCommand(
+  {{extensionId: '{EXT_ID}', commandName: '_execute_action', keybinding: '{SHORTCUT}'}},
+  () => r(chrome.runtime.lastError ? chrome.runtime.lastError.message : 'ok')))"""
+
+
+def evaluate(c: CDPClient, expr: str):
+    """_panel_cdp.evaluate, with a JS exception turned into this tool's die()."""
+    try:
+        return _evaluate(c, expr)
+    except RuntimeError as e:
+        die(f"chrome://extensions call failed: {e}")
+
+
+def navigate(c: CDPClient, url: str) -> None:
+    c.send_command("Page.navigate", {"url": url})
+    time.sleep(1.0)
+
+
+def ensure_shortcut(host: str, target: dict, email: str) -> None:
+    """Give Claude for Chrome the Alt+W binding in this profile, and record it.
+
+    Chrome ships the extension with no Windows shortcut, so on a fresh PC or a
+    new account Alt+W does nothing and open-panel has no way in.
+    """
+    c = connect(host, target)
+    try:
+        navigate(c, "chrome://extensions/shortcuts")
+        current = evaluate(c, GET)
+        if current != SHORTCUT:
+            res = evaluate(c, SET)
+            if res != "ok":
+                die(f"could not set {SHORTCUT} for Claude: {res}")
+            current = evaluate(c, GET)
+            if current != SHORTCUT:
+                die(f"set {SHORTCUT} but Chrome reports '{current}'. Another extension may own it.")
+            print(f"[setup] Claude shortcut set to {SHORTCUT} for {email}")
+    finally:
+        c.close()
+    known = set(OK_FILE.read_text().split()) if OK_FILE.exists() else set()
+    OK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OK_FILE.write_text("\n".join(sorted(known | {email})) + "\n")
+
+
+def close_tab(host: str, target: dict) -> None:
+    close_target(host, target["id"])
+
+
+def forget_shortcut(email: str) -> None:
+    """Drop the account's record so the next run re-checks the binding."""
+    if OK_FILE.exists():
+        OK_FILE.write_text("".join(f"{a}\n" for a in OK_FILE.read_text().split() if a != email))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--account", default=default_account())
+    ap.add_argument("--url")
+    ap.add_argument("--name")
+    ap.add_argument("--check-shortcut", action="store_true")
+    a = ap.parse_args()
+    a.account = resolve_account(a.account)
+    if not a.account:
+        die("no account. Pass --account <email>, set BRIDGE_ACCOUNT, or set \"default\" in ~/.config/claude-web-bridge/accounts.json.")
+    global ACCOUNT
+    ACCOUNT = a.account
+
+    # Hold through registration so two opens never press keys at the same time.
+    OPEN_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with OPEN_LOCK.open("a") as lock:
+        os.chmod(OPEN_LOCK, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return open_panel(a)
+
+
+def open_panel(a) -> int:
+    host = cdp_host()
+    if not host:
+        die(f"bridge Chrome is not reachable on port {PORT}. Run bridge-ready first.")
+    win = window_name(a.account)
+    known = set(OK_FILE.read_text().split()) if OK_FILE.exists() else set()
+
+    need_setup = a.check_shortcut or a.account not in known
+    set_up = False
+    claimed = False
+    for _ in range(3):
+        pages_before = {t["id"] for t in targets(host) if t["type"] == "page"}
+        panels_before = panel_ids(host)
+
+        def new_tabs():
+            return [t for t in targets(host) if t["type"] == "page" and t["id"] not in pages_before
+                    and not t["url"].startswith("chrome-extension://")]
+
+        if need_setup:
+            # A binding changed in this tab does not fire here (seen
+            # 2026-09-26), so set it up, close the tab, and use a fresh one.
+            press(win, ["ctrl+t"])
+            # Chrome may swap in a preloaded new-tab page that has no new
+            # target id; take a new-tab page target in that case.
+            new = wait_for(new_tabs, 5) or [t for t in targets(host) if t["type"] == "page"
+                                            and t["url"].startswith(("chrome://newtab", "chrome://new-tab-page"))][-1:]
+            if not new:
+                die(f"Ctrl+T in '{win}' opened no tab")
+            ensure_shortcut(host, new[0], a.account)
+            close_tab(host, new[0])
+            need_setup, set_up = False, True
+            continue
+
+        if not claimed:
+            claim("open-tab")
+            claimed = True
+            CLAIM_OPEN[0] = True
+        # Both chords in one focus session: Chrome handles Ctrl+T before Alt+W,
+        # so the panel opens in the new tab. Loading --url waits until after,
+        # when the user's window already has focus back.
+        press(win, ["ctrl+t", "alt+w"])
+        # The panel appearing is the success signal. A new page target is not:
+        # Chrome swaps in a preloaded new-tab page whose target already
+        # existed, so Ctrl+T sometimes adds no new target id and this died
+        # with "opened no tab" while the tab and panel were fine (2026-10-04).
+        panel = wait_for(lambda: panel_ids(host) - panels_before, 8)
+        new = new_tabs()
+        if not panel and set_up:
+            # A just-set binding can take a few seconds to register. No panel
+            # is open in this tab, so a second press cannot toggle one shut.
+            press(win, ["alt+w"])
+            panel = wait_for(lambda: panel_ids(host) - panels_before, 6)
+        if panel:
+            tab_id = next(iter(panel))
+            # Guard: if Ctrl+T was lost, Alt+W opened the panel on whatever tab
+            # was active, which may be one of the user's. Accept only a fresh tab.
+            url = in_worker(host, "chrome.tabs.get(%d).then(t => t.pendingUrl || t.url || '-', () => '')"
+                            % int(tab_id)) or ""
+            if url and not url.startswith(("chrome://newtab", "chrome://new-tab-page", "about:blank")):
+                die(f"Alt+W opened the panel on an existing tab ({url[:60]}), not a new one; "
+                    f"Ctrl+T was lost. Close that panel and retry.")
+            wait_registered(tab_id)
+            if a.name:
+                print(f"[open-panel] named {name_panel(tab_id, a.name)}", file=sys.stderr)
+            if a.url:
+                # By tab id through the extension, so it does not depend on
+                # finding the tab's CDP target (see the preloaded-NTP note).
+                in_worker(host, "chrome.tabs.update(%d, {url: %s}).then(() => 'ok', e => 'err: ' + e)"
+                          % (int(tab_id), json.dumps(a.url)))
+            print(tab_id)
+            return 0
+        for t in new:
+            close_tab(host, t)
+        if set_up:
+            break
+        # The recorded setup may be stale (shortcut removed by hand, new
+        # profile). Drop the record and redo setup.
+        forget_shortcut(a.account)
+        need_setup = True
+    if claimed:
+        claim("cancel-claim")
+    die(f"{SHORTCUT} opened no Claude side panel in '{win}'")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

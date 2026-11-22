@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# bridge-ready — bring the browser bridge to a verified-working state, or fail loudly.
+#
+# WHY THIS EXISTS
+#   Chrome refuses remote debugging on a default profile:
+#     "DevTools remote debugging requires a non-default data directory."
+#   It prints that to stderr and starts anyway, with no debug port. Every
+#   launch path that targets a real profile is therefore permanently broken,
+#   and it fails silently. This script only ever uses the isolated debug
+#   profile, and it does not claim success until CDP actually answers.
+#
+# PORTS
+#   9333  Chrome's own debug port, loopback only on the Windows side.
+#   9334  Windows forwarder fronting 0.0.0.0 so WSL can reach 9333.
+#   7777  bridge server.
+#   9222  NEVER. svchost holds it on this machine.
+#
+# Usage: bridge-ready [--restart]
+#          --restart  kill and relaunch Chrome even if CDP already answers.
+set -uo pipefail
+KIT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+REPO="$KIT_DIR"
+CHROME_PORT=9333
+WSL_PORT=9334
+SERVER="http://127.0.0.1:7777"
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_winenv.sh"
+PROFILE_WIN="${WIN_LOCALAPPDATA}\\chrome-debug"
+FORWARDER_WIN="${WIN_LOCALAPPDATA}\\chrome-debug-forwarder.py"
+CHROME_WIN='C:\Program Files\Google\Chrome\Application\chrome.exe'
+
+GW=$(ip route show default 2>/dev/null | awk '{print $3}')
+[ -n "$GW" ] || { echo "FAIL: no WSL default gateway"; exit 1; }
+
+ok(){ echo "  [OK  ] $*"; }
+bad(){ echo "  [FAIL] $*"; }
+info(){ echo "  [ .. ] $*"; }
+
+cdp_up(){ curl -s -m 3 "http://$GW:$WSL_PORT/json/version" 2>/dev/null | grep -q '"Browser"'; }
+sidepanel_count(){
+  curl -s -m 4 "http://$GW:$WSL_PORT/json/list" 2>/dev/null \
+    | grep -c 'sidepanel.html' || true
+}
+
+RESTART=0
+[ "${1:-}" = "--restart" ] && RESTART=1
+
+echo "bridge-ready"
+echo "---"
+
+# 1. Server ---------------------------------------------------------------
+if curl -s -m 3 "$SERVER/health" >/dev/null 2>&1; then
+  ok "server up on 7777"
+else
+  info "starting server"
+  ( cd "$REPO" && setsid systemd-run --user --scope --quiet --collect sh -c 'exec "$@"' sh python3 server/server.py </dev/null >/tmp/bridge.log 2>&1 & )
+  sleep 3
+  curl -s -m 3 "$SERVER/health" >/dev/null 2>&1 && ok "server started" || { bad "server would not start, see /tmp/bridge.log"; exit 1; }
+fi
+
+# 2. Windows CDP forwarder ------------------------------------------------
+if ss -ltn 2>/dev/null | grep -q ":$WSL_PORT " || \
+   powershell.exe -NoProfile -Command "(Get-NetTCPConnection -LocalPort $WSL_PORT -State Listen -ErrorAction SilentlyContinue | Measure-Object).Count" 2>/dev/null | tr -d '\r' | grep -qv '^0$'; then
+  ok "forwarder listening on $WSL_PORT"
+else
+  info "starting Windows forwarder"
+  ( setsid cmd.exe /c start "" /B python "$FORWARDER_WIN" >/dev/null 2>&1 & )
+  sleep 3
+  ok "forwarder launch issued"
+fi
+
+# 3. Chrome on the debug profile -----------------------------------------
+if [ "$RESTART" = 1 ] && cdp_up; then
+  info "--restart: closing the debug Chrome"
+  powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | Where-Object { \$_.CommandLine -like '*chrome-debug*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" >/dev/null 2>&1
+  sleep 3
+fi
+
+if cdp_up; then
+  ok "CDP already answering on $GW:$WSL_PORT"
+else
+  info "launching Chrome on the isolated debug profile (:$CHROME_PORT)"
+  ( setsid cmd.exe /c start "" /B "$CHROME_WIN" \
+      --user-data-dir="$PROFILE_WIN" \
+      --remote-debugging-port=$CHROME_PORT \
+      --disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows \
+      --no-first-run --no-default-browser-check >/dev/null 2>&1 & )
+  for i in $(seq 1 20); do
+    sleep 2
+    cdp_up && break
+  done
+  if cdp_up; then
+    ok "CDP answering on $GW:$WSL_PORT"
+  else
+    bad "CDP never came up. Chrome may have attached to an existing"
+    bad "chrome-debug process, or the forwarder is not reaching :$CHROME_PORT."
+    exit 1
+  fi
+fi
+
+VER=$(curl -s -m 3 "http://$GW:$WSL_PORT/json/version" | tr -d '\n' | sed 's/.*"Browser": *"\([^"]*\)".*/\1/')
+ok "browser: $VER"
+
+# 4. CDP daemon on the RIGHT port ----------------------------------------
+DAEMON_OK=0
+if pgrep -f "cdp_daemon.py" >/dev/null 2>&1; then
+  if pgrep -af "cdp_daemon.py" 2>/dev/null | grep -q "CDP_PORT=$WSL_PORT" || \
+     grep -q "CDP host: $GW:$WSL_PORT" /tmp/cdp.log 2>/dev/null; then
+    ok "cdp_daemon running against :$WSL_PORT"
+    DAEMON_OK=1
+  else
+    info "cdp_daemon running on the wrong port, restarting"
+    pkill -f cdp_daemon.py; sleep 1
+  fi
+fi
+if [ "$DAEMON_OK" = 0 ]; then
+  ( cd "$REPO" && setsid env CDP_HOST="$GW" CDP_PORT="$WSL_PORT" \
+      systemd-run --user --scope --quiet --collect sh -c 'exec "$@"' sh python3 daemon/cdp_daemon.py run </dev/null >/tmp/cdp.log 2>&1 & )
+  sleep 4
+  if grep -q "CDP host: $GW:$WSL_PORT" /tmp/cdp.log 2>/dev/null; then
+    ok "cdp_daemon started against :$WSL_PORT"
+  else
+    bad "cdp_daemon did not start cleanly, see /tmp/cdp.log"
+    exit 1
+  fi
+fi
+
+# 5. Side panel -----------------------------------------------------------
+SP=$(sidepanel_count)
+if [ "${SP:-0}" -gt 0 ]; then
+  ok "$SP Claude side panel target(s) visible to CDP"
+  echo "---"
+  echo "READY"
+  exit 0
+fi
+
+echo "---"
+echo "NOT READY: no Claude side panel in the debug Chrome."
+echo "Open the Claude side panel in the window that just appeared, then rerun:"
+echo "  bridge-ready"
+exit 2

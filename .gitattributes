@@ -1,0 +1,19 @@
+# Force LF on all text files. Without this, a Windows checkout produces CRLF
+# in .sh files which then fail under WSL with the cryptic
+#   env: $'bash\r': Permission denied
+# error. Equally bad for Python via the shebang. Pinning eol=lf prevents the
+# class of "agent on Windows can't even run install.sh" footguns.
+*               text=auto eol=lf
+*.sh            text eol=lf
+*.py            text eol=lf
+scripts/*       text eol=lf
+daemon/*        text eol=lf
+server/*        text eol=lf
+ui/extension/* text eol=lf
+skills/**/*.md  text eol=lf
+
+# Binary — never normalize.
+*.png           binary
+*.jpg           binary
+*.ico           binary
+*.cmd text eol=crlf

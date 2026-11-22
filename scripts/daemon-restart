@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Restart the CDP daemon so exactly one instance polls the queue.
+#
+# Why a script: killing by `pkill -f "cdp_daemon.py run"` matches the shell
+# that is about to start the new one, and took down the caller twice on
+# 2026-09-19. This finds the daemon by reading /proc/*/cmdline for the
+# daemon's own file path, skips itself, and starts the replacement detached
+# from the terminal so a closed shell does not take it with it.
+#
+# usage: daemon-restart [status|stop|start|restart]   (default: restart)
+set -u
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+DAEMON="daemon/cdp_daemon.py"
+LOG="${CDP_DAEMON_LOG:-/tmp/cdp.log}"
+
+pids() {
+  # Match on argv, not on the joined command line: argv[0] must be a python
+  # and argv[1] must be the daemon file. A heredoc or a comment that merely
+  # mentions the path in some caller's shell must never match. Also skip this
+  # script and every ancestor of it.
+  local d pid a0 a1 skip anc
+  skip=" $$ "
+  anc=$PPID
+  while [ -n "$anc" ] && [ "$anc" != "0" ] && [ "$anc" != "1" ]; do
+    skip="$skip$anc "
+    anc=$(awk '/^PPid:/{print $2}' "/proc/$anc/status" 2>/dev/null)
+  done
+  for d in /proc/[0-9]*; do
+    pid="${d#/proc/}"
+    case "$skip" in *" $pid "*) continue;; esac
+    a0=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | sed -n '1p')
+    a1=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | sed -n '2p')
+    case "$a0" in *python*) ;; *) continue;; esac
+    case "$a1" in *"$DAEMON") echo "$pid";; esac
+  done
+}
+
+status() {
+  local p; local n=0
+  for p in $(pids); do n=$((n+1)); echo "daemon pid $p  started $(ps -o lstart= -p "$p" 2>/dev/null)"; done
+  [ "$n" -eq 0 ] && echo "daemon: not running"
+  [ "$n" -gt 1 ] && echo "WARNING: $n daemons; duplicates race for the same dispatches"
+  return 0
+}
+
+stop() {
+  local p
+  for p in $(pids); do kill "$p" 2>/dev/null; done
+  sleep 2
+  for p in $(pids); do kill -9 "$p" 2>/dev/null; done
+  sleep 1
+  [ -z "$(pids)" ] && echo "daemon: stopped" || { echo "daemon: could not stop $(pids)"; return 1; }
+}
+
+start() {
+  if [ -n "$(pids)" ]; then echo "daemon already running: $(pids | tr '\n' ' ')"; return 0; fi
+  cd "$REPO" || return 1
+  setsid nohup systemd-run --user --scope --quiet --collect sh -c 'exec "$@"' sh python3 "$DAEMON" run >>"$LOG" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+  sleep 4
+  if [ -n "$(pids)" ]; then
+    echo "daemon started: pid $(pids | tr '\n' ' ') (log $LOG)"
+    tail -n 3 "$LOG" | sed 's/^/  /'
+  else
+    echo "daemon failed to start; last log lines:"; tail -n 8 "$LOG" | sed 's/^/  /'; return 1
+  fi
+}
+
+case "${1:-restart}" in
+  status) status;;
+  stop) stop;;
+  start) start;;
+  restart) stop; start;;
+  *) echo "usage: daemon-restart [status|stop|start|restart]"; exit 2;;
+esac

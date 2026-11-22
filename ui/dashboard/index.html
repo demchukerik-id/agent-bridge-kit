@@ -1,0 +1,70 @@
+<!doctype html>
+<html data-theme="paper-terminal">
+<head>
+<meta charset="utf-8">
+<title>BROWSER BRIDGE · dashboard</title>
+<link rel="icon" type="image/png" href="/dashboard/icon-128.png">
+<link rel="stylesheet" href="/dashboard/themes.css">
+</head>
+<body>
+
+<!-- token bootstrap: shown until a token is saved -->
+<div id="token-setup" class="token-setup" hidden>
+  <h2>connect to bridge</h2>
+  <p>paste your bearer token. found at
+     <code>~/.config/claude-web-bridge/token</code>.</p>
+  <input id="token-input" type="text" placeholder="paste token" />
+  <button id="token-save" class="bracket-btn">[ SAVE ]</button>
+</div>
+
+<!-- main card (matches popup preview layout exactly) -->
+<div id="dash-main" class="popup" hidden>
+
+  <!-- title bar: same shape as the extension panel's header -->
+  <div class="status-band">
+    <span class="hdr-title">BROWSER BRIDGE &#183; dashboard</span>
+    <span class="hdr-rule"></span>
+    <button id="theme-toggle" class="mini-btn" title="switch theme">LGT</button>
+    <span class="status-text" id="status-text">…</span>
+  </div>
+
+  <!-- BROWSER AGENTS -->
+  <div class="section">
+    <div class="section-label">
+      Browser agents
+      <span class="count" id="browser-count">0</span>
+    </div>
+    <div class="list" id="browser-list">
+      <div class="list-empty">loading…</div>
+    </div>
+  </div>
+
+  <!-- SKILLS -->
+  <div class="section">
+    <details id="skills-details" open>
+      <summary class="section-label">
+        Skills
+        <span class="count" id="skills-count">0</span>
+      </summary>
+      <div class="skills-strip" id="skills-strip"></div>
+    </details>
+  </div>
+
+  <!-- SETTINGS -->
+  <div class="section">
+    <details id="settings-details">
+      <summary class="section-label">Bearer token</summary>
+      <div class="settings-body">
+        <input id="settings-token" type="text" placeholder="paste token" />
+        <div class="settings-row">
+          <button id="settings-save" class="bracket-btn">SAVE</button>
+        </div>
+      </div>
+    </details>
+  </div>
+
+</div>
+
+<script src="/dashboard/app.js"></script>
+</body>
+</html>

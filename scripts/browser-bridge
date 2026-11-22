@@ -1,0 +1,1130 @@
+#!/usr/bin/env python3
+"""browser-bridge — CLI for the browser-claude-bridge local server."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+DEFAULT_URL = "http://127.0.0.1:7777"
+TOKEN_PATH = Path.home() / ".config" / "claude-web-bridge" / "token"
+HARD_LIMIT_S = 3600
+LONG_POLL_WAIT = 60
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def get_token() -> str:
+    tok = os.environ.get("BRIDGE_TOKEN")
+    if tok:
+        return tok.strip()
+    try:
+        return TOKEN_PATH.read_text().strip()
+    except OSError as e:
+        die(f"could not read bridge token from {TOKEN_PATH}: {e}")
+        return ""  # unreachable
+
+
+def get_base_url() -> str:
+    return os.environ.get("BRIDGE_URL", DEFAULT_URL).rstrip("/")
+
+
+def get_sender() -> str:
+    s = os.environ.get("BB_SENDER")
+    if s:
+        return s
+    s = os.environ.get("TMUX_PANE")
+    if s:
+        return s
+    return f"virtual:{socket.gethostname()}:{os.getpid()}"
+
+
+def http_request(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    timeout: float = 75.0,
+    allow_errors: bool = False,
+) -> dict[str, Any]:
+    url = get_base_url() + path
+    data = None
+    headers = {
+        "Authorization": f"Bearer {get_token()}",
+        "Accept": "application/json",
+    }
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", "replace")
+        except Exception:
+            err_body = ""
+        if allow_errors:
+            parsed: dict[str, Any] = {}
+            if err_body:
+                try:
+                    parsed = json.loads(err_body)
+                except json.JSONDecodeError:
+                    parsed = {"error": err_body}
+            parsed["_http_status"] = e.code
+            return parsed
+        die(f"HTTP {e.code} from {method} {path}: {err_body}")
+        return {}  # unreachable
+    except urllib.error.URLError as e:
+        die(f"connection error to {url}: {e}")
+        return {}  # unreachable
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        die(f"non-JSON response from {path}: {raw[:200]}")
+        return {}  # unreachable
+
+
+def cmd_list(_args: argparse.Namespace) -> int:
+    res = http_request("GET", "/panels/all")
+    panels = res.get("panels", [])
+    print(f"{'SHORT':<6} {'NAME':<24} {'TAB_ID':<12} PAGE_TITLE")
+    for p in panels:
+        short = str(p.get("short", ""))
+        name = str(p.get("name", ""))
+        tab_id = str(p.get("tab_id", ""))
+        title = str(p.get("page_title") or p.get("title") or "")
+        print(f"{short:<6} {name:<24} {tab_id:<12} {title}")
+    return 0
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    target = urllib.parse.quote(args.target, safe="")
+    try:
+        res = http_request("GET", f"/panels/{target}/last-reply")
+    except SystemExit:
+        raise
+    text = res.get("text")
+    if text is None:
+        die(f"no reply ever captured for {args.target}")
+    if args.n_chars is not None and args.n_chars > 0 and len(text) > args.n_chars:
+        text = text[-args.n_chars:]
+    print(text)
+    return 0
+
+
+def _send_or_die(body: dict[str, Any], force: bool = False) -> dict[str, Any]:
+    """POST /send with ACL-aware error surfacing.
+
+    The server returns 403 with a structured error body when the caller's
+    `from_pane` doesn't match the panel's owner (the popup relay-target
+    dropdown). Surface that as a clean, actionable message instead of a
+    raw HTTPError dump.
+    """
+    if force:
+        body["force"] = True
+    res = http_request("POST", "/send", body, allow_errors=True)
+    if res.get("_http_status") == 403 and res.get("owner"):
+        die(
+            f"forbidden: panel '{res.get('panel')}' is owned by "
+            f"'{res.get('owner')}' in the popup. Caller "
+            f"'{res.get('caller')}' cannot dispatch.\n  fix: "
+            f"{res.get('hint', 'change the popup routing or use --force')}"
+        )
+    status = res.get("_http_status")
+    if status and status >= 400:
+        die(f"HTTP {status} from POST /send: {res.get('error', res)}")
+    return res
+
+
+def cmd_type(args: argparse.Namespace) -> int:
+    text = " ".join(args.text)
+    body = {
+        "to_panel": args.target,
+        "from_pane": get_sender(),
+        "text": text,
+        "auto_submit": False,
+        "mode": "sidepanel",
+    }
+    res = _send_or_die(body, force=getattr(args, "force", False))
+    msg_id = res.get("id")
+    if not msg_id:
+        die(f"server did not return an id: {res}")
+    print(msg_id)
+    return 0
+
+
+def cmd_keys(args: argparse.Namespace) -> int:
+    body = {
+        "to_panel": args.target,
+        "from_pane": get_sender(),
+        "keys_only": True,
+        "keys": list(args.key),
+        "mode": "sidepanel",
+    }
+    res = _send_or_die(body, force=getattr(args, "force", False))
+    msg_id = res.get("id")
+    if not msg_id:
+        die(f"server did not return an id: {res}")
+    print(msg_id)
+    return 0
+
+
+def cmd_message(args: argparse.Namespace) -> int:
+    sender = get_sender()
+    payload = " ".join(args.text)
+    # The panel gets the text exactly as written. Until 2026-09-19 every
+    # message opened with "[browser-bridge from:%N at:/brN — load the
+    # browser-claude-bridge skill to reply]". Claude for Chrome has no skills
+    # to load and reads a bracketed directive in its composer as text planted
+    # by the page, so it refused the message as a prompt injection. Routing
+    # never needed the header: the server keys the reply on the dispatch id
+    # and stamps it with the panel's tag when it pastes it into the pane.
+    body = {
+        "to_panel": args.target,
+        "from_pane": sender,
+        "text": payload,
+        "mode": "sidepanel",
+    }
+    # Task progress for sessions-overview (GET /tasks). Optional; without
+    # --task nothing changes.
+    if getattr(args, "task", None):
+        body["task_id"] = args.task
+        if args.step:
+            if not re.fullmatch(r"\d+/\d+", args.step):
+                die("--step takes N/M, for example --step 2/5")
+            body["step"] = args.step
+        if args.step_name:
+            body["step_name"] = args.step_name
+    elif getattr(args, "step", None) or getattr(args, "step_name", None):
+        die("--step and --step-name need --task <id>")
+    res = _send_or_die(body, force=getattr(args, "force", False))
+    msg_id = res.get("id")
+    if not msg_id:
+        die(f"server did not return an id: {res}")
+
+    # 2026-09-19: replies for a tmux sender are pasted straight into that
+    # pane by the server and are never put in the /reply buffer, so polling
+    # GET /reply here can only end in "404 not found" once the panel finishes
+    # thinking. That message was read as a failure three times today. Only a
+    # virtual sender (no tmux pane) has anything to wait for.
+    if not str(sender).startswith("virtual:"):
+        print(f"sent to {args.target} (id {msg_id}). The reply is pasted into pane {sender} "
+              f"when the panel finishes; errors arrive the same way. Progress: tail -f /tmp/cdp.log")
+        return 0
+
+    deadline = time.monotonic() + HARD_LIMIT_S
+    qid = urllib.parse.quote(str(msg_id), safe="")
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            die(f"timed out waiting for reply to id {msg_id}")
+        wait = min(LONG_POLL_WAIT, int(remaining) + 1)
+        reply = http_request(
+            "GET", f"/reply?id={qid}&wait={wait}", timeout=wait + 15, allow_errors=True
+        )
+        if isinstance(reply, dict) and reply.get("_http_status") == 404 and not reply.get("pending"):
+            die(f"no reply buffered for id {msg_id} and nothing in flight; "
+                f"read the panel with: browser-bridge read {args.target}")
+        text = reply.get("text") if isinstance(reply, dict) else None
+        if text is not None and reply.get("id"):
+            print(text)
+            return 0
+        if isinstance(reply, dict) and reply.get("text") is not None:
+            print(reply["text"])
+            return 0
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    """End a --task: browser-bridge task <id> done|failed."""
+    res = http_request("POST", "/tasks/end", {"task_id": args.id, "state": args.state})
+    print(f"task {args.id}: {res.get('task', {}).get('state', args.state)}")
+    return 0
+
+
+def cmd_name(args: argparse.Namespace) -> int:
+    """Rename a browser-agent panel in BOTH places that store a name:
+
+    1. panels.json (the bridge's registered name — what dispatchers address
+       and what shows in /panels/all).
+    2. The Chrome tab group title (what the user sees in Chrome's tab strip).
+
+    Both are kept in sync by default. Pass --skip-chrome to only rename the
+    panels.json entry. Pass --chrome-title to specify the current Chrome group
+    title explicitly when it differs from the panels.json name (e.g. when the
+    discovered title had an emoji prefix that the registered name dropped).
+
+    Chrome tab-group rename uses the bridge's control channel, which can be
+    raced by multiple extensions polling the same control queue. Retry until
+    one of them reports back from a Chrome that actually has the matching
+    group, or give up after 8 attempts with a clear warning."""
+    target_quoted = urllib.parse.quote(args.target, safe="")
+    res = http_request(
+        "POST", f"/panels/{target_quoted}/rename", {"new_name": args.new_label},
+        allow_errors=True,
+    )
+    if not res.get("ok"):
+        # Surface server-side hints (gap #15: discovered-but-not-registered).
+        status = res.get("_http_status")
+        if status == 404 and res.get("kind") == "discovered":
+            tab_id = res.get("tab_id")
+            die(
+                f"panel '{args.target}' is discovered but not yet registered "
+                f"(tab_id={tab_id}).\n"
+                f"  fix: send any message to it first — the bridge auto-registers\n"
+                f"       the panel on the first successful reply. Then retry:\n"
+                f"         browser-bridge name '{args.target}' {args.new_label}"
+            )
+        if status == 404:
+            hint = res.get("hint") or "list known panels with: browser-bridge list"
+            die(f"panels.json rename failed: {res.get('error', res)}\n  fix: {hint}")
+        die(f"panels.json rename failed: {res}")
+    print(f"renamed in panels.json: {args.target} -> {args.new_label}")
+
+    if getattr(args, "skip_chrome", False):
+        return 0
+
+    chrome_from = getattr(args, "chrome_title", None) or args.target
+    # When the target resolved to a known tab_id, pass it to the extension
+    # so renameTabGroup can disambiguate when several groups share a title
+    # (the common case after an auto-discover of two un-grouped Claude
+    # tabs that each got the default "Claude" title).
+    rename_tab_id = None
+    try:
+        resolve = http_request("GET", "/panels/all")
+        for p in resolve.get("panels", []):
+            if p.get("name") == args.target or str(p.get("short")) == args.target or str(p.get("short_legacy")) == args.target or str(p.get("tab_id")) == str(args.target):
+                rename_tab_id = p.get("tab_id")
+                break
+        # After the panels.json rename above, the entry is now keyed by
+        # args.new_label — fall back to that too.
+        if rename_tab_id is None:
+            for p in resolve.get("panels", []):
+                if p.get("name") == args.new_label:
+                    rename_tab_id = p.get("tab_id")
+                    break
+    except SystemExit:
+        pass
+    last_err = None
+    for attempt in range(1, 9):
+        body = {"from": chrome_from, "to": args.new_label, "from_pane": "virtual:cli-rename"}
+        if rename_tab_id is not None:
+            body["tab_id"] = rename_tab_id
+        send_res = http_request("POST", "/tabgroups/rename", body)
+        mid = send_res.get("id")
+        if not mid:
+            print(f"  attempt {attempt}: dispatch did not queue ({send_res})")
+            time.sleep(1)
+            continue
+        try:
+            reply = http_request("GET", f"/reply?id={mid}&wait=6")
+        except Exception as e:
+            print(f"  attempt {attempt}: reply fetch failed: {e}")
+            time.sleep(1)
+            continue
+        text = reply.get("text") or ""
+        if "[control:ok] tabGroup.rename" in text:
+            print(f"renamed Chrome tab group: {chrome_from} -> {args.new_label}")
+            return 0
+        last_err = text.strip() or str(reply)
+        print(f"  attempt {attempt}: {last_err}")
+        time.sleep(1)
+
+    print(
+        "WARNING: Chrome tab group rename did not complete after 8 attempts.\n"
+        f"  panels.json rename succeeded; the Chrome group keeps its old title.\n"
+        f"  last error: {last_err}\n"
+        f"  fix: pass --chrome-title with the EXACT current title shown in the\n"
+        f"       'Edit tab group' dialog (right-click the colored group in the\n"
+        f"       Chrome tab strip)."
+    )
+    return 0
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    """Remove a panel from panels.json. Does NOT touch the Chrome tab —
+    use `kill-agents` for that. Useful for clearing stale red entries
+    in the popup after a tab has been closed externally.
+    """
+    body = {"target": args.target}
+    res = http_request("POST", "/panels/forget", body, allow_errors=True)
+    if res.get("_http_status") == 404:
+        die(f"{res.get('error', 'unknown')}\n  fix: {res.get('hint', '')}")
+    if not res.get("forgotten"):
+        die(f"forget failed: {res}")
+    print(f"forgotten: {res['forgotten']} (tab_id={res.get('tab_id')})")
+    return 0
+
+
+def cmd_forget_stale(args: argparse.Namespace) -> int:
+    """Remove every panel whose tab is no longer open in the bridge Chrome.
+
+    Cross-checks panels.json against the extension's pushed tab list. Any
+    registered panel whose tab_id is gone gets dropped. Safe default for
+    clearing the popup's red rows after closing chats in the browser.
+    """
+    panels_res = http_request("GET", "/panels/all")
+    panels = panels_res.get("panels", [])
+    # Extension pushes its live tab inventory to /tabs; we read it back.
+    tabs_res = http_request("GET", "/tabs", allow_errors=True)
+    tab_ids: set[int] = set()
+    if isinstance(tabs_res, dict):
+        for t in tabs_res.get("tabs", []) or []:
+            try:
+                tab_ids.add(int(t.get("id")))
+            except (TypeError, ValueError):
+                continue
+    stale = [
+        p for p in panels
+        if p.get("kind") == "registered" and p.get("tab_id") not in tab_ids
+    ]
+    if not stale:
+        print("no stale registered panels")
+        return 0
+    if not getattr(args, "yes", False):
+        print(f"about to forget {len(stale)} stale panel(s):")
+        for p in stale:
+            print(f"  - {p.get('name')} (tab_id={p.get('tab_id')})")
+        print("re-run with --yes to confirm.")
+        return 1
+    failed = []
+    for p in stale:
+        res = http_request("POST", "/panels/forget", {"target": p.get("name")}, allow_errors=True)
+        if res.get("forgotten"):
+            print(f"forgotten: {res['forgotten']} (tab_id={res.get('tab_id')})")
+        else:
+            print(f"FAILED to forget {p.get('name')}: {res}")
+            failed.append(p)
+    return 0 if not failed else 1
+
+
+def _control_wait(mid: str, timeout: float = 8.0) -> dict[str, Any]:
+    """Poll /reply for a queued control item until it settles or times out.
+
+    /reply returns 404 with {pending: true} while the control item hasn't
+    been picked up by the extension yet — that's expected, so use
+    allow_errors=True and keep polling instead of dying.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        reply = http_request("GET", f"/reply?id={mid}&wait=2", allow_errors=True)
+        if reply.get("_http_status") and reply.get("_http_status") >= 500:
+            return {}
+        if reply.get("text") is not None and reply.get("id"):
+            return reply
+        # 404/pending: keep polling.
+    return {}
+
+
+def _cdp_alive() -> bool:
+    """Probe CDP /json/version. True = bridge Chrome is up; False = it's gone.
+
+    Used by cmd_kill_all to report success when Chrome exits before its
+    `windows.closeAll` control reply can be polled.
+    """
+    host = os.environ.get("CDP_HOST")
+    if not host:
+        # Best-effort: parse `ip route show default` on WSL2/Linux. If we
+        # can't, fall back to localhost.
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=2,
+            )
+            parts = out.stdout.split()
+            host = parts[2] if len(parts) >= 3 else "127.0.0.1"
+        except Exception:
+            host = "127.0.0.1"
+    # 9334 is the forwarder port WSL can reach; 9222 is held by svchost.
+    port = int(os.environ.get("CDP_PORT", "9334"))
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/json/version", timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def cmd_kill_agents(args: argparse.Namespace) -> int:
+    """Close every Chrome tab the bridge knows as a registered panel.
+
+    Keeps panels.json intact (the closed tabs simply show as stale until
+    the operator re-opens them). Does NOT touch the browser process — the
+    bridge Chrome stays running. Use `kill-all` to also quit the browser.
+    """
+    res = http_request("GET", "/panels/all")
+    panels = [p for p in res.get("panels", []) if p.get("tab_id") is not None and p.get("kind") == "registered"]
+    if not panels:
+        print("no registered panels to close")
+        return 0
+    tab_ids = [int(p["tab_id"]) for p in panels]
+    names = [p.get("name", "?") for p in panels]
+    if not getattr(args, "yes", False):
+        print(f"about to close {len(tab_ids)} panel tabs:")
+        for n, t in zip(names, tab_ids):
+            print(f"  - {n} (tab_id={t})")
+        print("re-run with --yes to confirm.")
+        return 1
+    send = http_request("POST", "/tabs/close", {"tab_ids": tab_ids, "from_pane": "virtual:cli-kill-agents"})
+    mid = send.get("id")
+    if not mid:
+        die(f"tabs.close dispatch did not queue: {send}")
+    reply = _control_wait(mid)
+    text = reply.get("text") or "(no reply within 8s — tabs may still have closed; verify with `browser-bridge list`)"
+    print(text)
+    return 0 if "[control:ok]" in text else 1
+
+
+def cmd_kill_all(args: argparse.Namespace) -> int:
+    """Close every registered panel tab, then quit the bridge Chrome.
+
+    Order: tabs first (so claude.ai conversations get a clean unmount),
+    then `chrome.windows.remove` on every window of the bridge Chrome.
+    The bridge server, CDP daemon, and reply-relay watcher stay running.
+    """
+    if not getattr(args, "yes", False):
+        res = http_request("GET", "/panels/all", )
+        panels = [p for p in res.get("panels", []) if p.get("kind") == "registered"]
+        print(f"about to close {len(panels)} panel tabs AND quit the bridge Chrome browser.")
+        print("the bridge server, CDP daemon, and watcher will keep running.")
+        print("re-run with --yes to confirm.")
+        return 1
+    # 1. Close tabs first (best effort — don't bail if there are none).
+    cargs = argparse.Namespace(yes=True)
+    cmd_kill_agents(cargs)
+    # 2. Close the browser windows. Chrome typically exits before the
+    # extension can post the windows.closeAll reply, so treat
+    # "no reply within 5s AND CDP is unreachable" as the success signal.
+    send = http_request("POST", "/browser/close", {"from_pane": "virtual:cli-kill-all"})
+    mid = send.get("id")
+    if not mid:
+        die(f"windows.closeAll dispatch did not queue: {send}")
+    reply = _control_wait(mid, timeout=5.0)
+    text = reply.get("text")
+    if text:
+        print(text)
+        return 0 if "[control:ok]" in text else 1
+    # No reply — check whether Chrome is actually gone before reporting.
+    if not _cdp_alive():
+        print("[control:ok] windows.closeAll — Chrome exited before posting reply (CDP unreachable, success)")
+        return 0
+    print("(no reply within 5s, but CDP is still reachable — windows.closeAll may not have fired; check chrome://extensions and retry)")
+    return 1
+
+
+_STATUS_PREFIXES = ("\u231b", "\u2705", "\U0001f504", "\u274c", "\U0001f514")  # ⌛ ✅ 🔄 ❌ 🔔, as in server.py
+
+
+def _bare_name(s: str) -> str:
+    """The name without the extension's status marker. The tab group title, and
+    with it the registered name, turns "x" into "⌛x" while a task runs and
+    "✅x" after, so close-panel/delete-chat by name failed (2026-10-04)."""
+    t = (s or "").strip()
+    while t.startswith(_STATUS_PREFIXES):
+        t = t[1:].lstrip()
+    return t
+
+
+def _tab_id_for(label: str) -> int:
+    """Friendly name, /brN short, legacy %N alias, or a numeric tab_id."""
+    if label.isdigit():
+        return int(label)
+    res = http_request("GET", "/panels/all")
+    for p in res.get("panels", []):
+        if (_bare_name(str(p.get("name") or "")) == _bare_name(label)
+                or str(p.get("short")) == label or str(p.get("short_legacy")) == label):
+            tab_id = p.get("tab_id")
+            if tab_id is None:
+                die(f"panel matched but has no tab_id: {p}")
+            return int(tab_id)
+    die(f"no panel matching label: {label}")
+    return -1  # unreachable
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    print(_tab_id_for(args.label))
+    return 0
+
+
+def cmd_id(_args: argparse.Namespace) -> int:
+    print(get_sender())
+    return 0
+
+
+def cmd_new_tab(_args: argparse.Namespace) -> int:
+    """Ask the bridge server to open a brand-new Chrome tab.
+
+    The caller's pane id is passed as `from_pane` so that whichever panel
+    next gets discovered in Chrome auto-routes its replies back here. This
+    mirrors the `tmux-new-tab` thin bash wrapper — keeping both entry
+    points so operators can use whichever feels natural.
+    """
+    sender = get_sender()
+    res = http_request(
+        "POST", "/browser/open-tab", {"from_pane": sender},
+        allow_errors=True,
+    )
+    status = res.get("_http_status")
+    if status and status >= 400:
+        die(f"HTTP {status} from /browser/open-tab: {res.get('error', res)}")
+    print(
+        f"[ok] new tab opened. Click the Claude extension icon on the new "
+        f"tab and open a chat — it'll be auto-routed back to this pane "
+        f"({sender})."
+    )
+    return 0
+
+
+def cmd_open_panel(args: argparse.Namespace) -> int:
+    """Open a new tab and its Claude side panel by shortcut (Ctrl+T, Alt+W).
+
+    The work is in scripts/bridge-open-panel, which also sets Alt+W up the
+    first time on a PC or profile that has no shortcut."""
+    cmd = [str(Path(__file__).resolve().parent / "bridge-open-panel")]
+    if args.account:
+        cmd += ["--account", args.account]
+    if args.url:
+        cmd += ["--url", args.url]
+    if args.name:
+        cmd += ["--name", args.name]
+    if args.check_shortcut:
+        cmd.append("--check-shortcut")
+    return subprocess.run(cmd).returncode
+
+
+def _close_panel(target: str, delete: bool) -> int:
+    """Run scripts/bridge-close-panel, then drop the panel from panels.json
+    so `list` stops showing it."""
+    tab_id = _tab_id_for(target)
+    cmd = [str(Path(__file__).resolve().parent / "bridge-close-panel"), str(tab_id)]
+    if delete:
+        cmd.append("--delete")
+    rc = subprocess.run(cmd).returncode
+    if rc == 0:
+        http_request("POST", "/panels/forget", {"tab_id": tab_id}, allow_errors=True)
+    return rc
+
+
+def cmd_close_panel(args: argparse.Namespace) -> int:
+    return _close_panel(args.target, delete=False)
+
+
+def cmd_delete_chat(args: argparse.Namespace) -> int:
+    return _close_panel(args.target, delete=True)
+
+
+def cmd_delete_tasks(args: argparse.Namespace) -> int:
+    """Delete chats by their Recent tasks id (cse_...) and close the tab groups
+    they were open in. See scripts/bridge-close-panel --tasks."""
+    cmd = [str(Path(__file__).resolve().parent / "bridge-close-panel"), "--tasks", *args.ids]
+    if args.account:
+        cmd += ["--account", args.account]
+    return subprocess.run(cmd).returncode
+
+
+def cmd_rename_last_tab(args: argparse.Namespace) -> int:
+    """Rename the last tab opened from this pane via tmux-new-tab.
+
+    Server tracks the most recent tab created on behalf of each `from_pane`
+    so we can address it without needing the operator to know the tab_id.
+    Optional --color updates the Chrome tab-group color at the same time.
+    """
+    body: dict[str, Any] = {
+        "from_pane": get_sender(),
+        "new_name": args.name,
+    }
+    if getattr(args, "color", None):
+        body["color"] = args.color
+    res = http_request(
+        "POST", "/browser/rename-last-tab", body, allow_errors=True,
+    )
+    status = res.get("_http_status")
+    if status == 200 or (status is None and res):
+        print(f'[ok] renamed last tab to "{args.name}"')
+        return 0
+    die(f"HTTP {status} from /browser/rename-last-tab: {res.get('error', res)}")
+    return 1  # unreachable
+
+
+
+# --- chrome-debug forwarder helpers (2026-09-19) -------------------------------
+# Chrome binds 127.0.0.1:9333; windows/chrome-debug-forwarder.py fronts 9334 so
+# WSL can reach it. It is a plain python process with no supervisor.
+def _win_localappdata() -> str:
+    """%LOCALAPPDATA% on the Windows side, resolved per PC (the Windows
+    username differs between machines). BRIDGE_WIN_LOCALAPPDATA overrides."""
+    v = os.environ.get("BRIDGE_WIN_LOCALAPPDATA", "")
+    if v:
+        return v
+    try:
+        v = subprocess.run(["cmd.exe", "/c", "echo %LOCALAPPDATA%"], cwd="/mnt/c",
+                           capture_output=True, text=True, timeout=10
+                           ).stdout.strip().splitlines()[-1].strip()
+    except Exception:
+        v = ""
+    return "" if v.startswith("%") else v
+
+
+def _forwarder_win_path() -> str:
+    # Resolved on use, not at import: every CLI call would otherwise pay for a
+    # cmd.exe round trip it does not need.
+    return _win_localappdata() + r"\chrome-debug-forwarder.py"
+
+
+def _forwarder_start_hint() -> str:
+    return ('powershell.exe -NoProfile -Command "Start-Process -FilePath python '
+            f"-ArgumentList '{_forwarder_win_path()}' -WindowStyle Hidden\"")
+
+
+def _windows_listening_ports(ports) -> set:
+    """Which of `ports` have a LISTEN socket on the Windows side. Empty set on
+    any failure (no powershell, timeout), which the caller treats as unknown."""
+    want = ",".join(str(p) for p in ports)
+    cmd = (f"Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | "
+           f"Where-Object {{ @({want}) -contains $_.LocalPort }} | "
+           f"Select-Object -ExpandProperty LocalPort")
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", cmd],
+                           capture_output=True, text=True, timeout=25)
+        return {int(x) for x in r.stdout.split() if x.strip().isdigit()}
+    except Exception:
+        return set()
+
+
+def _start_windows_forwarder() -> bool:
+    """Start the forwarder detached on Windows. Prefers the installed copy in
+    AppData; falls back to the repo copy under windows/. The script has a
+    single-instance guard, so a duplicate start exits by itself."""
+    candidates = [_forwarder_win_path()]
+    repo_copy = Path(__file__).resolve().parent.parent / "windows" / "chrome-debug-forwarder.py"
+    if repo_copy.exists():
+        try:
+            w = subprocess.run(["wslpath", "-w", str(repo_copy)], capture_output=True, text=True, timeout=5)
+            if w.stdout.strip():
+                candidates.append(w.stdout.strip())
+        except Exception:
+            pass
+    for win_path in candidates:
+        wsl_path = None
+        try:
+            wsl_path = subprocess.run(["wslpath", "-u", win_path], capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            pass
+        if wsl_path and not Path(wsl_path).exists():
+            continue
+        try:
+            subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                            f"Start-Process -FilePath python -ArgumentList '{win_path}' -WindowStyle Hidden"],
+                           capture_output=True, text=True, timeout=25)
+            return True
+        except Exception:
+            continue
+    return False
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """Print pass/fail for every prerequisite needed to dispatch a message.
+
+    Diagnoses the wedge case (panel reported by the extension but not
+    reachable via the daemon's CDP) — the highest-cost-to-debug failure mode.
+    """
+    import hashlib
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    ok_all = True
+
+    def pr(status: str, msg: str, hint: str = "") -> None:
+        nonlocal ok_all
+        if status != "OK":
+            ok_all = False
+        print(f"  [{status:4}] {msg}")
+        if hint:
+            print(f"           hint: {hint}")
+
+    print("browser-bridge doctor")
+    print("---")
+
+    # 1. Token file
+    tok_file = Path.home() / ".config" / "claude-web-bridge" / "token"
+    if not tok_file.exists():
+        pr("FAIL", f"token file missing: {tok_file}",
+           "run `python3 server/server.py` once; it creates the file on first run.")
+        return 1
+    try:
+        tok = tok_file.read_text().strip()
+    except Exception as e:
+        pr("FAIL", f"cannot read token file: {e}")
+        return 1
+    if not tok:
+        pr("FAIL", f"token file {tok_file} is empty",
+           "run `python3 server/server.py --rotate-token` to generate a fresh one.")
+        return 1
+    sha8 = hashlib.sha256(tok.encode()).hexdigest()[:8]
+    pr("OK", f"token file present ({len(tok)} chars, sha8={sha8})")
+
+    # 2. Server reachable + auth accepted
+    base = get_base_url()
+    try:
+        with urllib.request.urlopen(f"{base}/health", timeout=3) as r:
+            health_body = json.loads(r.read())
+        pr("OK",
+           f"server reachable at {base} (queued={health_body.get('queued')}, "
+           f"tabs={health_body.get('tabs')})")
+    except Exception as e:
+        pr("FAIL", f"server unreachable at {base}: {e}",
+           "is `python3 server/server.py` running?")
+        return 1
+
+    try:
+        req = urllib.request.Request(
+            f"{base}/panels/all",
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as r:
+            panels_body = json.loads(r.read())
+        pr("OK", "server bearer auth accepted (200 from /panels/all)")
+    except Exception as e:
+        pr("FAIL", f"auth check failed: {e}",
+           "token file may not match the server's in-memory token. Restart the server.")
+        return 1
+
+    # 3. Daemon process
+    # 2026-09-19: match on argv, not on the joined command line. `pgrep -af`
+    # counted every shell whose command text merely mentioned the file (a
+    # heredoc, this very doctor run) and reported three daemons when one ran.
+    proc_lines = []
+    try:
+        me = str(_os.getpid())
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit() or d.name == me:
+                continue
+            try:
+                argv = (d / "cmdline").read_bytes().split(b"\0")
+            except Exception:
+                continue
+            if len(argv) >= 2 and b"python" in argv[0] and argv[1].endswith(b"daemon/cdp_daemon.py"):
+                proc_lines.append(f"{d.name} {argv[1].decode(errors='replace')}")
+    except Exception:
+        proc_lines = []
+    if proc_lines:
+        if len(proc_lines) > 1:
+            pr("WARN", f"cdp_daemon running {len(proc_lines)} times; only one should poll the queue",
+               "run: bridge-daemon restart   (stops all, starts one detached). "
+               "Duplicates race for the same dispatches. (2026-09-19)")
+        else:
+            pr("OK", f"cdp_daemon running ({len(proc_lines)} process(es))")
+    else:
+        pr("WARN", "cdp_daemon NOT detected via pgrep",
+           "start it: `cd <repo> && "
+           "CDP_HOST=$(ip route show default | awk '{print $3}') "
+           "python3 daemon/cdp_daemon.py run &`")
+
+    # 4. CDP reachable + sidepanel.html present
+    cdp_host = _os.environ.get("CDP_HOST")
+    if not cdp_host:
+        try:
+            r = _subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=2,
+            )
+            parts = r.stdout.split()
+            if "via" in parts:
+                cdp_host = parts[parts.index("via") + 1]
+        except Exception:
+            pass
+        cdp_host = cdp_host or "127.0.0.1"
+    # 9334 is the forwarder port WSL can reach; 9222 is held by svchost.
+    cdp_port = int(_os.environ.get("CDP_PORT", "9334"))
+    cdp_url = f"http://{cdp_host}:{cdp_port}/json"
+    try:
+        with urllib.request.urlopen(cdp_url, timeout=3) as r:
+            targets = json.loads(r.read())
+        side_panels = [t for t in targets if "sidepanel.html" in (t.get("url") or "")]
+        if side_panels:
+            pr("OK",
+               f"CDP reachable at {cdp_host}:{cdp_port} "
+               f"({len(targets)} targets, {len(side_panels)} sidepanel.html)")
+        else:
+            pr("WARN",
+               f"CDP reachable but no sidepanel.html target in {len(targets)} pages",
+               f"open the Claude for Chrome side panel in the bridge Chrome window.")
+    except Exception as e:
+        # 2026-09-19: "unreachable at 9334" has two different causes and the
+        # old hint blamed the wrong one. Chrome listens on 127.0.0.1:9333 and a
+        # Windows-side forwarder fronts 9334 for WSL. When the forwarder dies
+        # (nothing restarts it) Chrome is fine and relaunching it changes
+        # nothing. So ask Windows which port is actually listening, and if it
+        # is only the forwarder that is missing, start it and re-probe.
+        listening = _windows_listening_ports((9333, cdp_port))
+        if 9333 in listening and cdp_port not in listening:
+            started = _start_windows_forwarder()
+            targets = None
+            if started:
+                for _ in range(6):
+                    time.sleep(1.0)
+                    try:
+                        with urllib.request.urlopen(cdp_url, timeout=3) as r:
+                            targets = json.loads(r.read())
+                        break
+                    except Exception:
+                        continue
+            if targets is not None:
+                side_panels = [t for t in targets if "sidepanel.html" in (t.get("url") or "")]
+                pr("OK",
+                   f"CDP reachable at {cdp_host}:{cdp_port} after restarting the forwarder "
+                   f"({len(targets)} targets, {len(side_panels)} sidepanel.html)",
+                   "the chrome-debug forwarder (9334 -> 9333) had died; it was restarted just now.")
+            else:
+                pr("FAIL",
+                   f"Chrome is up on 9333 but the forwarder on {cdp_port} is not running and could not be started",
+                   f"start it by hand: {_forwarder_start_hint()}")
+                return 1
+        elif 9333 not in listening:
+            pr("FAIL", f"CDP unreachable at {cdp_host}:{cdp_port}: {e}",
+               "nothing is listening on 9333 either, so the chrome-debug Chrome itself is not running. "
+               "Launch it with --remote-debugging-port=9333 (the profile-group launcher does this).")
+            return 1
+        else:
+            pr("FAIL", f"CDP unreachable at {cdp_host}:{cdp_port}: {e}",
+               f"both 9333 and {cdp_port} are listening on Windows but WSL cannot reach {cdp_host}:{cdp_port}. "
+               "Check the WSL gateway address (ip route show default) and Windows Firewall.")
+            return 1
+
+    # 5. Panel reachability cross-check (orphan detection preview)
+    extension_panels = panels_body.get("panels") or []
+    extension_tab_ids = {p.get("tab_id") for p in extension_panels}
+    cdp_tab_ids = set()
+    for t in (tt for tt in targets if "sidepanel.html" in (tt.get("url") or "")):
+        url = t.get("url", "")
+        if "tabId=" in url:
+            try:
+                cdp_tab_ids.add(int(url.split("tabId=")[1].split("&")[0]))
+            except Exception:
+                pass
+    orphans = extension_tab_ids - cdp_tab_ids
+    unreported = cdp_tab_ids - extension_tab_ids
+    if extension_panels:
+        if orphans:
+            visible_orphans = sorted(o for o in orphans if o is not None)
+            pr("WARN",
+               f"{len(orphans)} panel(s) reported by extension but NOT in daemon's Chrome: {visible_orphans}",
+               "dispatches to those tabs will fail. Open the side panel in the bridge Chrome.")
+        else:
+            pr("OK",
+               f"all {len(extension_panels)} reported panel(s) match a sidepanel.html in the daemon's Chrome")
+        if unreported:
+            pr("WARN",
+               f"{len(unreported)} sidepanel.html in CDP but NOT reported by extension: {sorted(unreported)}",
+               "extension push may be lagging or auth-failing; check the popup.")
+    else:
+        pr("WARN", "no panels currently registered or discovered",
+           "open a Claude for Chrome side panel in the bridge Chrome window.")
+
+    # 6. tmux-bridge for the reply relay (optional)
+    tmb = _os.environ.get("TMUX_BRIDGE_BIN") or "tmux-bridge"
+    if _shutil.which(tmb) or Path(_os.path.expanduser(tmb)).exists():
+        pr("OK", f"tmux-bridge available ({tmb})")
+    else:
+        pr("WARN", f"tmux-bridge not found in PATH ({tmb})",
+           "reply-relay to your tmux pane will not work; install smux or set TMUX_BRIDGE_BIN.")
+
+    print("---")
+    print("OK" if ok_all else "ISSUES DETECTED")
+    return 0 if ok_all else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="browser-bridge",
+        description="CLI for the browser-claude-bridge local server.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("list", help="list all panels")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("read", help="read last reply from a target")
+    sp.add_argument("target")
+    sp.add_argument("n_chars", nargs="?", type=int, default=None)
+    sp.set_defaults(func=cmd_read)
+
+    sp = sub.add_parser("type", help="type text into target (no submit)")
+    sp.add_argument("target")
+    sp.add_argument("text", nargs="+")
+    sp.add_argument(
+        "--force", action="store_true",
+        help="bypass the dispatch ACL (server logs the override).",
+    )
+    sp.set_defaults(func=cmd_type)
+
+    sp = sub.add_parser("keys", help="send raw keys to target")
+    sp.add_argument("target")
+    sp.add_argument("key", nargs="+")
+    sp.add_argument(
+        "--force", action="store_true",
+        help="bypass the dispatch ACL (server logs the override).",
+    )
+    sp.set_defaults(func=cmd_keys)
+
+    sp = sub.add_parser(
+        "message", help="send headed message and wait for reply"
+    )
+    sp.add_argument("target")
+    sp.add_argument("text", nargs="+")
+    sp.add_argument(
+        "--force", action="store_true",
+        help="bypass the dispatch ACL (server logs the override).",
+    )
+    # Screenshots were removed on 2026-10-25; the flag stays as a no-op so
+    # older scripts that pass it keep working.
+    sp.add_argument("--no-shots", action="store_true", help=argparse.SUPPRESS)
+    sp.add_argument("--task", metavar="ID", help="group this message into task ID (shown in GET /tasks)")
+    sp.add_argument("--step", metavar="N/M", help="this message works on step N of M planned steps")
+    sp.add_argument("--step-name", metavar="TEXT", help="short name of step N")
+    sp.set_defaults(func=cmd_message)
+
+    sp = sub.add_parser("task", help="end a --task: done or failed")
+    sp.add_argument("id")
+    sp.add_argument("state", choices=["done", "failed"])
+    sp.set_defaults(func=cmd_task)
+
+    sp = sub.add_parser(
+        "name",
+        help="rename a panel in both panels.json AND Chrome tab group title",
+    )
+    sp.add_argument("target", help="current panel name OR %%N alias OR tab_id")
+    sp.add_argument("new_label", help="new name (must match [A-Za-z0-9_-]+)")
+    sp.add_argument(
+        "--chrome-title",
+        help="explicit current Chrome tab group title if it differs from target",
+    )
+    sp.add_argument(
+        "--skip-chrome",
+        action="store_true",
+        help="rename only in panels.json; do not touch the Chrome tab group",
+    )
+    sp.set_defaults(func=cmd_name)
+
+    sp = sub.add_parser(
+        "forget",
+        help="remove a panel from panels.json (does not close its tab)",
+    )
+    sp.add_argument("target", help="panel name OR %%N alias OR tab_id")
+    sp.set_defaults(func=cmd_forget)
+
+    sp = sub.add_parser(
+        "forget-stale",
+        help="remove every registered panel whose tab is no longer open",
+    )
+    sp.add_argument("--yes", action="store_true", help="skip confirmation")
+    sp.set_defaults(func=cmd_forget_stale)
+
+    sp = sub.add_parser(
+        "kill-agents",
+        help="close every registered panel tab (browser stays running)",
+    )
+    sp.add_argument("--yes", action="store_true", help="skip confirmation")
+    sp.set_defaults(func=cmd_kill_agents)
+
+    sp = sub.add_parser(
+        "kill-all",
+        help="close every registered panel tab AND quit the bridge Chrome",
+    )
+    sp.add_argument("--yes", action="store_true", help="skip confirmation")
+    sp.set_defaults(func=cmd_kill_all)
+
+    sp = sub.add_parser("resolve", help="resolve a label to tab_id")
+    sp.add_argument("label")
+    sp.set_defaults(func=cmd_resolve)
+
+    sp = sub.add_parser("id", help="print resolved sender identity")
+    sp.set_defaults(func=cmd_id)
+
+    sp = sub.add_parser(
+        "new-tab",
+        help="open a new Chrome tab; next discovered panel auto-routes here",
+    )
+    sp.set_defaults(func=cmd_new_tab)
+
+    sp = sub.add_parser(
+        "open-panel",
+        help="open a new tab and its Claude side panel (Ctrl+T, Alt+W); prints the tab_id",
+    )
+    sp.add_argument("--account", default="",
+                    help="profile window to use, by signed-in account (default: BRIDGE_ACCOUNT or accounts.json)")
+    sp.add_argument("--url", help="load this url in the new tab first")
+    sp.add_argument("--name", help="task name for the panel and its tab group; chat and group are deleted 5 h after opening")
+    sp.add_argument("--check-shortcut", action="store_true",
+                    help="verify Alt+W in chrome://extensions/shortcuts even if already recorded")
+    sp.set_defaults(func=cmd_open_panel)
+
+    sp = sub.add_parser(
+        "close-panel",
+        help="close a panel's whole Claude tab group; the chat stays saved",
+    )
+    sp.add_argument("target", help="name, /brN, or tab_id")
+    sp.set_defaults(func=cmd_close_panel)
+
+    sp = sub.add_parser(
+        "delete-chat",
+        help="delete a panel's claude.ai chat, then close its whole tab group",
+    )
+    sp.add_argument("target", help="name, /brN, or tab_id")
+    sp.set_defaults(func=cmd_delete_chat)
+
+    sp = sub.add_parser(
+        "delete-tasks",
+        help="delete chats by Recent tasks id (cse_...) and close the tab groups they were open in",
+    )
+    sp.add_argument("ids", nargs="+", metavar="CSE_ID")
+    sp.add_argument("--account", default="", help="profile whose chats these are (default: BRIDGE_ACCOUNT or accounts.json)")
+    sp.set_defaults(func=cmd_delete_tasks)
+
+    sp = sub.add_parser(
+        "rename-last-tab",
+        help="rename the last tab opened from this pane via tmux-new-tab",
+    )
+    sp.add_argument("name", help="new tab-group title")
+    sp.add_argument(
+        "--color",
+        choices=["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"],
+        help="Chrome tab-group color",
+    )
+    sp.set_defaults(func=cmd_rename_last_tab)
+
+    sp = sub.add_parser(
+        "doctor",
+        help="run prerequisite checks: token, server, daemon, CDP, panel reachability",
+    )
+    sp.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        die("interrupted", 130)
